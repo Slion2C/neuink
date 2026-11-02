@@ -13,6 +13,13 @@ export type DiversityCandidate = {
   key: string;
   score: number;
   text: string;
+  /** Section identity returned by the BookRAG-aware backend. */
+  sectionPath?: string | null;
+};
+
+export type DiversityOptions = {
+  /** An explicit section filter makes same-section evidence intentional. */
+  sectionFilter?: string | null;
 };
 
 export function lexicalTerms(text: string) {
@@ -45,7 +52,8 @@ export function jaccardSimilarity(left: Set<string>, right: Set<string>) {
 export function selectDiverseEvidence<T extends DiversityCandidate>(
   candidates: T[],
   limit: number,
-  lambda = DEFAULT_LAMBDA
+  lambda = DEFAULT_LAMBDA,
+  options: DiversityOptions = {}
 ): T[] {
   const unique = new Map<string, T>();
   for (const candidate of candidates) {
@@ -72,7 +80,11 @@ export function selectDiverseEvidence<T extends DiversityCandidate>(
         0
       );
       if (redundancy >= DUPLICATE_SIMILARITY) continue;
-      const value = lambda * item.relevance - (1 - lambda) * redundancy;
+      const sameSectionCount = item.candidate.sectionPath
+        ? selected.filter((chosen) => chosen.candidate.sectionPath === item.candidate.sectionPath).length
+        : 0;
+      const sectionPenalty = options.sectionFilter || sameSectionCount < 2 ? 0 : 0.15 * sameSectionCount;
+      const value = lambda * item.relevance - (1 - lambda) * redundancy - sectionPenalty;
       // Ties keep the backend order so equal-score results stay deterministic.
       if (value > bestValue || (value === bestValue && item.index < remaining[bestPosition].index)) {
         bestValue = value;

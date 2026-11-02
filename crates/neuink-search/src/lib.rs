@@ -4,9 +4,11 @@ mod fastembed_provider;
 mod memory_index;
 mod persistent_semantic_index;
 mod query;
+mod query_plan;
 mod result;
 mod rrf;
 mod search_index_trait;
+mod section_tree_index;
 mod token;
 mod vector_store_trait;
 
@@ -23,6 +25,7 @@ pub use persistent_semantic_index::{
     INDEX_FORMAT_VERSION, SEMANTIC_INDEX_FORMAT_VERSION,
 };
 pub use query::{SearchInclude, SearchMode, SearchQuery, SearchScope};
+pub use query_plan::{infer_query_plan, QueryModality, QueryPlan};
 pub use result::{
     SearchDocument, SearchDocumentSource, SearchDocumentSourceKind, SearchEntryGroup, SearchHit,
     SearchResults, SearchTarget, SearchTextSection,
@@ -31,4 +34,8 @@ pub use rrf::{
     adaptive_hybrid_weights, reciprocal_rank_fusion, weighted_reciprocal_rank_fusion, DEFAULT_RRF_K,
 };
 pub use search_index_trait::SearchIndex;
+pub use section_tree_index::{
+    build_section_tree_index, section_prior, section_role_prior, segment_type_matches_filter,
+    SectionTreeEntry, SectionTreeIndex,
+};
 pub use vector_store_trait::{VectorRecord, VectorSearchHit, VectorStore};

@@ -38,6 +38,9 @@ pub struct WorkspaceSearchRecord {
     pub segment_uid: Option<SegmentUid>,
     pub page_idx: Option<u32>,
     pub segment_type: Option<SegmentType>,
+    /// Existing paragraph translation, kept separate so semantic indexing can
+    /// deliberately exclude it while BM25F can use it as a secondary field.
+    pub translation: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -81,6 +84,7 @@ impl Workspace {
                     segment_uid: None,
                     page_idx: None,
                     segment_type: None,
+                    translation: None,
                 });
 
                 for (name, value) in &entry.fields {
@@ -100,6 +104,7 @@ impl Workspace {
                         segment_uid: None,
                         page_idx: None,
                         segment_type: None,
+                        translation: None,
                     });
                 }
 
@@ -119,9 +124,12 @@ impl Workspace {
                         segment_uid: None,
                         page_idx: None,
                         segment_type: None,
+                        translation: None,
                     });
                 }
             }
+
+            let paragraph_translations = self.read_paragraph_translations(&entry.id)?;
 
             if options.include_notes {
                 for content in &entry.contents {
@@ -140,6 +148,7 @@ impl Workspace {
                         segment_uid: None,
                         page_idx: None,
                         segment_type: None,
+                        translation: None,
                     });
                     if !note.markdown.trim().is_empty() {
                         let text =
@@ -157,6 +166,7 @@ impl Workspace {
                             segment_uid: None,
                             page_idx: None,
                             segment_type: None,
+                            translation: None,
                         });
                     }
                 }
@@ -197,6 +207,7 @@ impl Workspace {
                         segment_uid: Some(note.segment_uid),
                         page_idx,
                         segment_type: segment.map(|segment| segment.segment_type),
+                        translation: None,
                     });
                 }
 
@@ -242,6 +253,7 @@ impl Workspace {
                         segment_uid: Some(annotation.segment_uid),
                         page_idx,
                         segment_type,
+                        translation: None,
                     });
                 }
             }
@@ -311,6 +323,7 @@ impl Workspace {
                         segment_uid: Some(segment_uid),
                         page_idx: Some(page_idx),
                         segment_type: Some(segment_type),
+                        translation: None,
                     });
                 }
 
@@ -342,9 +355,13 @@ impl Workspace {
                         tag_id: None,
                         tag_path: None,
                         note_id: None,
-                        segment_uid: Some(segment.uid),
+                        segment_uid: Some(segment.uid.clone()),
                         page_idx: Some(segment.page_idx),
                         segment_type: Some(segment.segment_type),
+                        translation: translation_for_segment(
+                            &paragraph_translations,
+                            &segment.uid,
+                        ),
                     });
                 }
             }
@@ -359,6 +376,17 @@ fn structured_markdown_note_text(entry_title: &str, note_title: &str, markdown: 
         "Entry: {entry_title}\nSource: Markdown note\nNote title: {note_title}\nContent:\n{}",
         markdown.trim()
     )
+}
+
+fn translation_for_segment(
+    translations: &BTreeMap<String, crate::paragraph_translation::ParagraphTranslation>,
+    segment_uid: &SegmentUid,
+) -> Option<String> {
+    translations
+        .get(segment_uid.as_str())
+        .and_then(|record| record.paragraph.value.as_ref())
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
 }
 
 fn structured_segment_note_text(
