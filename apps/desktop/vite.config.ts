@@ -2,11 +2,16 @@ import path from 'node:path';
 
 import tailwindcss from '@tailwindcss/vite';
 import react from '@vitejs/plugin-react';
-import { defineConfig } from 'vite';
+import { configDefaults, defineConfig } from 'vitest/config';
 
 import { pdfJsAssetsPlugin } from './vite/pdfJsAssetsPlugin';
 
 export default defineConfig({
+  test: {
+    // Packaging uses Node's test runner, not Vitest.
+    // Packaging scripts use Node's test runner, not Vitest's browser-oriented collection.
+    exclude: [...configDefaults.exclude, '**/scripts/*.test.cjs']
+  },
   plugins: [react(), tailwindcss(), pdfJsAssetsPlugin()],
   clearScreen: false,
   resolve: {

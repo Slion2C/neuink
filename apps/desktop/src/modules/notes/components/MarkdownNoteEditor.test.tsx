@@ -1,16 +1,73 @@
 // @vitest-environment jsdom
 
 import { act, cleanup, fireEvent, render, waitFor } from '@testing-library/react';
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 
 import { ToastContext } from '@/shared/hooks/useToast';
+import type { SourceLink } from '@/shared/types/domain';
 
 import { MarkdownNoteEditor } from './MarkdownNoteEditor';
 import { discardSegmentEditorsBeforeClose, hasUnsavedSegmentEditors, saveSegmentEditorsBeforeClose } from '@/modules/reader/components/segmentEditorDirtyRegistry';
 
 afterEach(cleanup);
+beforeAll(() => {
+  Object.defineProperty(Range.prototype, 'getClientRects', { configurable: true, value: () => [] });
+  Object.defineProperty(Range.prototype, 'getBoundingClientRect', { configurable: true, value: () => new DOMRect() });
+});
 
 describe('MarkdownNoteEditor dirty state', () => {
+  it('navigates its outline without dirtying the shared note or scheduling an autosave', async () => {
+    vi.stubGlobal('ResizeObserver', class { observe() {} unobserve() {} disconnect() {} });
+    const save = vi.fn();
+    const result = render(<ToastContext.Provider value={{ dismiss: vi.fn(), notify: vi.fn(() => 'toast') }}>
+      <MarkdownNoteEditor entryId="outline-note" noteId="outline-note" fallbackTitle="Outline"
+        onLoadNote={async () => ({ note_id: 'outline-note', title: 'Outline', markdown: '## Target section\n\nBody', links: [], revision: '1' })}
+        onSaveNote={save} />
+    </ToastContext.Provider>);
+    try {
+      await waitFor(() => expect(result.getByRole('button', { name: '展开笔记目录' })).toHaveProperty('disabled', false));
+      const viewport = result.container.querySelector<HTMLElement>('.markdown-note-scroll')!;
+      const heading = result.container.querySelector('h2')!;
+      Object.defineProperties(viewport, {
+        clientHeight: { value: 400 }, offsetHeight: { value: 400 }, scrollHeight: { value: 1600 },
+      });
+      vi.spyOn(viewport, 'getBoundingClientRect').mockReturnValue(new DOMRect(0, 100, 400, 400));
+      vi.spyOn(heading, 'getBoundingClientRect').mockReturnValue(new DOMRect(0, 600, 200, 30));
+      const editorNode = result.container.querySelector('.tiptap')!;
+      const before = editorNode.innerHTML;
+      const root = result.container.querySelector('.markdown-note-editor')!;
+      expect(root.firstElementChild?.classList.contains('markdown-note-outline-slot')).toBe(true);
+      expect(root.children[1].classList.contains('markdown-note-main')).toBe(true);
+      fireEvent.click(result.getByRole('button', { name: '展开笔记目录' }));
+      fireEvent.click(await result.findByRole('button', { name: '定位2 级标题：Target section' }));
+      expect(viewport.scrollTop).toBe(484);
+      expect(result.getByRole('navigation', { name: '笔记文内定位' })).toBeTruthy();
+      fireEvent.click(result.getByRole('button', { name: '收起笔记目录' }));
+      fireEvent.click(result.getByRole('button', { name: '展开笔记目录' }));
+      expect(result.container.querySelector('.tiptap')).toBe(editorNode);
+      expect(result.container.querySelector('.markdown-note-scroll')).toBe(viewport);
+      expect(viewport.scrollTop).toBe(484);
+      expect(result.container.querySelector('.tiptap')!.innerHTML).toBe(before);
+      expect(result.container.querySelector('[data-guide-note-save-state]')?.getAttribute('data-guide-note-save-state')).toBe('saved');
+      await act(async () => { await new Promise(resolve => setTimeout(resolve, 1100)); });
+      expect(save).not.toHaveBeenCalled();
+    } finally { vi.restoreAllMocks(); vi.unstubAllGlobals(); }
+  });
+
+  it('inserts one queued source link into a shared note, including its metadata, not once per view', async () => {
+    const link = { anchor_id: 'sl-split', created_at: '', display_text: 'p.1', link_id: 'split-link',
+      owner: { entry_id: 'shared-source', kind: 'note' as const, note_id: 'n' },
+      sources: [{ entry_id: 'paper', page: 1, quote_hash: '', segment_uid: 's', snapshot_text: 'Evidence' }] };
+    const save = vi.fn(async (title: string, markdown: string, links: SourceLink[]) => ({ note_id: 'n', title, markdown, links, revision: '2' }));
+    const props = { entryId: 'shared-source', noteId: 'n', fallbackTitle: 'Sources', sourceLinkToInsert: link,
+      onLoadNote: async () => ({ note_id: 'n', title: 'Sources', markdown: 'Body', links: [], revision: '1' }), onSaveNote: save };
+    const result = render(<ToastContext.Provider value={{ dismiss: vi.fn(), notify: vi.fn(() => 'toast') }}><MarkdownNoteEditor {...props} /><MarkdownNoteEditor {...props} /></ToastContext.Provider>);
+    await waitFor(() => expect(result.container.querySelectorAll('.tiptap[contenteditable="true"]')).toHaveLength(2));
+    await act(async () => { await new Promise(resolve => setTimeout(resolve, 1100)); });
+    expect(save).toHaveBeenCalledOnce();
+    expect(save.mock.calls[0][2]).toEqual([link]);
+    expect(save.mock.calls[0][1].match(/\[\^sl-split\]/g)).toHaveLength(1);
+  });
   it('includes embedded note drafts in parent close protection and truly discards a failed draft', async () => {
     const save = vi.fn().mockRejectedValue(new Error('disk unavailable'));
     const result = render(<ToastContext.Provider value={{ dismiss: vi.fn(), notify: vi.fn(() => 'toast') }}><MarkdownNoteEditor
@@ -31,14 +88,14 @@ describe('MarkdownNoteEditor dirty state', () => {
     expect(save).toHaveBeenCalledOnce();
   });
 
-  it('reports a second view as read-only and never grants it an insertion target', async () => {
+  it('allows both views of the same note to edit the shared document', async () => {
     const writableA = vi.fn(), writableB = vi.fn();
     const props = { entryId: 'shared-parallel', noteId: 'shared', fallbackTitle: 'Shared',
       onLoadNote: async () => ({ note_id: 'shared', title: 'Shared', markdown: 'Body', links: [], revision: '1' }), onSaveNote: vi.fn() };
     const result = render(<ToastContext.Provider value={{ dismiss: vi.fn(), notify: vi.fn(() => 'toast') }}><MarkdownNoteEditor {...props} onWritableChange={writableA} /><MarkdownNoteEditor {...props} editorScopeKey="tag-reading:other/note:shared" onWritableChange={writableB} /></ToastContext.Provider>);
     await waitFor(() => expect(writableA).toHaveBeenLastCalledWith(true));
-    expect(writableB).not.toHaveBeenCalledWith(true);
-    expect(result.container.querySelectorAll('.tiptap[contenteditable="true"]')).toHaveLength(1);
+    await waitFor(() => expect(writableB).toHaveBeenLastCalledWith(true));
+    expect(result.container.querySelectorAll('.tiptap[contenteditable="true"]')).toHaveLength(2);
     expect(hasUnsavedSegmentEditors('tag-reading:other')).toBe(false);
   });
   it('does not mark a freshly loaded normalized Markdown document as unsaved', async () => {

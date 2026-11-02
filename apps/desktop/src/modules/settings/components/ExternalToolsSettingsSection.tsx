@@ -1,6 +1,8 @@
-import { TabsContent } from '@/components/ui/tabs';
-import { cn } from '@/lib/utils';
+import { SettingsPage } from './SettingsPrimitives';
 import { SciverseSettingsSection } from '@/modules/sciverse/components/SciverseSettingsSection';
+import { ResearchSettingsSection } from './ResearchSettingsSection';
+import { AssistantDebugSetting } from './AssistantDebugSetting';
+import { LocalAgentSettingsSection } from './LocalAgentSettingsSection';
 
 import { AgentToolRuntimeSection } from './AgentSettingsSection';
 import { ADVANCED_ASSISTANT_SETTINGS_VISIBLE } from '../settingsCatalog';
@@ -14,25 +16,14 @@ export function ExternalToolsSettingsSection({
   const active = props.activeSettingsTab === 'external-tools';
 
   return (
-    <TabsContent
-      forceMount
-      value="external-tools"
-      className="settings-content"
-    >
-      <div className={cn('settings-panel-content-inner settings-form', 'grid gap-4')}>
-        <div>
-          <h2 className="text-base font-semibold">外部检索</h2>
-          <p className="mt-1 text-xs leading-5 text-muted-foreground">
-            配置 Sciverse 文献检索服务，凭据保存在系统凭据库中。
-          </p>
-        </div>
-
-        <div data-setting-id="tools-services" tabIndex={-1}><SciverseSettingsSection active={active} /></div>
+    <SettingsPage tab="external-tools" title="检索与工具" description="管理论文和网页检索、本地 Agent 及诊断选项。">
+        <LocalAgentSettingsSection active={active} workspaceRoot={props.workspaceRoot} />
+        <ResearchSettingsSection active={active}><SciverseSettingsSection active={active} /></ResearchSettingsSection>
+        <AssistantDebugSetting />
         {ADVANCED_ASSISTANT_SETTINGS_VISIBLE && <fieldset data-setting-id="tools-mcp" tabIndex={-1} disabled={props.runtimeUnavailable} className="min-w-0"><AgentToolRuntimeSection
           runtimeSettings={props.runtimeSettings}
           onUpdateRuntimeSettings={props.onUpdateRuntimeSettings}
         /></fieldset>}
-      </div>
-    </TabsContent>
+    </SettingsPage>
   );
 }

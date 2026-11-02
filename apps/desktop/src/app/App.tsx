@@ -1,5 +1,7 @@
+import { fetchEntryPdf } from '@/shared/ipc/entryPdfApi';
 import { Library, ListFilter, MessageSquare, PanelRight, Search, Settings } from 'lucide-react';
-import { fetch as tauriFetch } from '@tauri-apps/plugin-http';
+import { OnboardingGuide } from '@/modules/onboarding/OnboardingGuide';
+import { importOnboardingPaper } from '@/shared/ipc/onboardingApi';
 import {
   type CSSProperties,
   type KeyboardEvent as ReactKeyboardEvent,
@@ -7,12 +9,15 @@ import {
   useCallback,
   useEffect,
   useMemo,
-  useReducer,
   useRef,
-  useState
+  useState,
+  useSyncExternalStore
 } from 'react';
 
 import { Button } from '@/components/ui/button';
+import { usePdfParseQueue } from '@/shared/hooks/usePdfParseQueue';
+import { PdfParseQueuePanel } from '@/modules/library/components/PdfParseQueuePanel';
+import { Empty, EmptyDescription, EmptyHeader, EmptyMedia } from '@/components/ui/empty';
 import {
   Dialog,
   DialogContent,
@@ -31,7 +36,6 @@ import {
   defaultEntryContentId,
   entryContentSurface,
   entryContentId,
-  initialWorkspaceSurfaceLayout,
   noteSurface,
   sourceLinkSurfaceActions,
   surfaceKey,
@@ -43,6 +47,10 @@ import {
   type WorkspaceSurface
 } from './workspaceSurface';
 import { resolveEntrySidebarContext, resolveTagNoteSidebarContext } from './entrySidebarContext';
+import { useWorkspaceSession } from './useWorkspaceSession';
+import { resolveSourceLinkSurface } from './workspaceSourceNavigation';
+import { assistantEvidenceNavigation } from './assistantReplyNavigation';
+import { localizeSciverseImages } from './sciverseRemoteImages';
 import { TagNoteDetailsSidebar } from '../modules/notes/components/TagNoteDetailsSidebar';
 import { sameTagEntries, startTagReadingActions, tagNoteOpenPane, tagReadingMoveTargets, tagReadingSurface } from './tagReadingNavigation';
 import { SameTagSidebar } from '../modules/library/components/SameTagSidebar';
@@ -55,9 +63,11 @@ import {
   type SidePanel
 } from './activityBarState';
 import { WorkspaceTabsBar } from './WorkspaceTabsBar';
+import { assistantSurfaceContext } from './assistantSurfaceContext';
+import { useBrowserTabRequests } from './useBrowserTabRequests';
 import {
-  clampWorkspaceSplitLeftWidth,
-  getWorkspaceSplitMinimums
+  getWorkspaceSplitMinimums,
+  workspaceSplitLeftWidthFromRatio
 } from './workspaceSplit';
 import { AssistantPanel } from '../modules/assistant/components/AssistantPanel';
 import type { AssistantComposerDraft } from '../modules/assistant/components/AssistantComposerEditor';
@@ -77,6 +87,8 @@ import { useSidebarResize } from './useSidebarResize';
 import { useUnsavedWindowCloseGuard } from './useUnsavedWindowCloseGuard';
 import type { PdfJumpRequest, SidePaneState, SidePaneTarget } from '../modules/reader/types';
 import { SearchDialog } from '../modules/search/components/SearchDialog';
+import { AssistantReplyActionsContext } from '../modules/assistant/components/AssistantReplyActionsContext';
+import { ResearchPaperActionsProvider } from '../modules/assistant/components/ResearchPaperActions';
 import { AppearanceIcon } from '../shared/components/AppearanceIcon';
 import { AppearanceExit } from '../shared/components/AppearanceExit';
 import { SearchPanel } from '../modules/search/components/SearchPanel';
@@ -85,8 +97,15 @@ import { useSearchIndexStatus } from '../modules/search/hooks/useSearchIndexStat
 import { JobStatusDock } from '../shared/components/JobStatusDock';
 import { TitleBar } from '../shared/components/TitleBar';
 import { useToast } from '../shared/hooks/useToast';
+import { usePdfDropImport } from './usePdfDropImport';
+import { noteCatalogRefreshKey } from './noteCatalogRefreshKey';
 import { useWorkspace } from '../shared/hooks/useWorkspace';
 import { useWorkspaceJobs } from '../shared/hooks/useWorkspaceJobs';
+import { getLocalBackgroundJobs, subscribeLocalBackgroundJobs } from '../shared/lib/localBackgroundJobs';
+import { useAssistantTaskDock } from './useAssistantTaskDock';
+import { workspaceTaskProjection } from './workspaceTaskProjection';
+import { isRunningJob, recentBackgroundJobs } from '../shared/lib/backgroundJobs';
+import { assistantErrorDiagnostic, formatAssistantError, readAssistantDebug, ASSISTANT_IMPORT_INCOMPLETE } from '../shared/lib/assistantDebug';
 import {
   APP_THEME_STORAGE_KEY,
   APP_THEME_PRESETS,
@@ -114,8 +133,7 @@ import {
   type SciverseLibraryImportResult
 } from '../shared/ipc/assistantApi';
 import {
-  prepareSciversePaperImport,
-  readSciverseContent
+  prepareSciversePaperImport
 } from '../modules/sciverse/api/sciverseApi';
 import type {
   AssistantActiveNote,
@@ -134,7 +152,9 @@ import type {
   SearchHit
 } from '../shared/ipc/workspaceApi';
 import type { SourceLink } from '../shared/types/domain';
-import { saveNoteAssetBytes, updateNote } from '../shared/ipc/workspaceApi';
+import { updateNote } from '../shared/ipc/workspaceApi';
+import { saveSciverseNoteImage } from '../shared/ipc/sciverseImagesApi';
+import { readAllSciversePaperContent } from './sciverseContent';
 
 type PendingMarkdownNoteDelete = {
   entryId: string;
@@ -160,6 +180,7 @@ import {
   SIDEBAR_WIDTH_STORAGE_KEY,
   SIDE_PANEL_STORAGE_KEY,
   WORKSPACE_SPLIT_WIDTH_STORAGE_KEY,
+  WORKSPACE_SPLIT_RATIO_STORAGE_KEY,
   conversationToMarkdown,
   formatVectorStatus,
   getWorkspaceSplitContainerWidth,
@@ -170,41 +191,12 @@ import {
   readStoredSidePanel,
   readStoredSidebarWidth,
   readStoredWorkspaceSplitLeftWidth,
+  readStoredWorkspaceSplitRatio,
   toLibraryEntry
 } from './appSupport';
 
 function workspaceEntryPdfPath(root: string | null, entryId: string) {
   return root ? `${root.replace(/[\\/]+$/, '')}/entries/${entryId}/paper.pdf` : undefined;
-}
-
-const SCIVERSE_REMOTE_CONTENT_PAGE_LIMIT = 16_000;
-const SCIVERSE_REMOTE_CONTENT_MAX_PAGES = 256;
-const SCIVERSE_REMOTE_IMAGE_MAX_BYTES = 20 * 1024 * 1024;
-
-async function readAllSciversePaperContent(docId: string) {
-  const chunks: string[] = [];
-  let offset = 0;
-  let truncated = false;
-
-  for (let page = 0; page < SCIVERSE_REMOTE_CONTENT_MAX_PAGES; page += 1) {
-    const response = await readSciverseContent({
-      doc_id: docId,
-      limit: SCIVERSE_REMOTE_CONTENT_PAGE_LIMIT,
-      offset
-    });
-    if (response.text.trim()) chunks.push(response.text.trim());
-    if (!response.more) break;
-    if (response.next_offset <= offset) {
-      throw new Error('Sciverse 正文分页未推进，已停止保存。');
-    }
-    offset = response.next_offset;
-    truncated = page + 1 === SCIVERSE_REMOTE_CONTENT_MAX_PAGES;
-  }
-
-  return {
-    text: chunks.join('\n\n'),
-    truncated
-  };
 }
 
 function buildSciverseRemoteContentMarkdown(
@@ -226,163 +218,15 @@ function buildSciverseRemoteContentMarkdown(
 }
 
 async function localizeSciverseRemoteImages({
-  entryId,
-  markdown,
-  noteId,
-  root,
-  source
+  entryId, markdown, noteId, root
 }: {
   entryId: string;
   markdown: string;
   noteId: string;
   root: string;
-  source: Extract<ConversationSourceLink, { provider: 'sciverse' }>;
 }) {
-  const replacements = new Map<string, Promise<string>>();
-  const failures: string[] = [];
-  let imageCount = 0;
-
-  const localize = async (url: string, alt: string) => {
-    if (!replacements.has(url)) {
-      imageCount += 1;
-      replacements.set(
-        url,
-        saveSciverseRemoteImage({ entryId, noteId, root, source, url, imageIndex: imageCount }).catch((error) => {
-          const message = error instanceof Error ? error.message : String(error);
-          failures.push(`${alt || url}：${message}`);
-          return `[图片未能保存到本地：${alt || '远程图片'}]`;
-        })
-      );
-    }
-    return replacements.get(url)!;
-  };
-
-  const markdownPattern = /!\[([^\]]*)\]\(\s*(?:<([^>]+)>|([^\s)]+))(?:\s+(?:"[^"]*"|'[^']*'))?\s*\)/g;
-  const htmlPattern = /<img\b[^>]*\bsrc\s*=\s*(["'])(.*?)\1[^>]*>/gi;
-  let result = await replaceAsync(markdown, markdownPattern, async (whole, alt, bracketedUrl, bareUrl) => {
-    const path = await localize(bracketedUrl || bareUrl, alt);
-    return path.startsWith('./') ? `![${alt}](${path})` : path;
-  });
-  result = await replaceAsync(result, htmlPattern, async (whole, _quote, url) => {
-    const alt = /\balt\s*=\s*(["'])(.*?)\1/i.exec(whole)?.[2] ?? '远程图片';
-    const path = await localize(url, alt);
-    return path.startsWith('./') ? `<img src="${path}" alt="${escapeHtmlAttribute(alt)}" />` : path;
-  });
-
-  if (failures.length === 0) return result;
-  const summary = failures.slice(0, 5).map((failure) => `- ${failure}`).join('\n');
-  const remaining = failures.length > 5 ? `\n- 另有 ${failures.length - 5} 张图片未能保存。` : '';
-  return `${result}\n\n> 以下远程图片未能离线保存，在线引用已移除：\n${summary}${remaining}\n`;
-}
-
-async function saveSciverseRemoteImage({
-  entryId,
-  imageIndex,
-  noteId,
-  root,
-  source,
-  url
-}: {
-  entryId: string;
-  imageIndex: number;
-  noteId: string;
-  root: string;
-  source: Extract<ConversationSourceLink, { provider: 'sciverse' }>;
-  url: string;
-}) {
-  const resolvedUrl = resolveSciverseImageUrl(url, source.access_oa_url);
-  if (!resolvedUrl) throw new Error('图片地址不是可下载的 HTTP(S) 或 data 图片。');
-
-  if (resolvedUrl.startsWith('data:')) {
-    const payload = dataImagePayload(resolvedUrl);
-    return (await saveNoteAssetBytes(
-      root,
-      entryId,
-      noteId,
-      payload.mimeType,
-      payload.dataBase64,
-      `sciverse-image-${imageIndex}`
-    )).markdown_path;
-  }
-
-  const response = await tauriFetch(resolvedUrl);
-  if (!response.ok) throw new Error(`图片下载失败：HTTP ${response.status}`);
-  const contentLength = Number(response.headers.get('content-length') ?? 0);
-  if (Number.isFinite(contentLength) && contentLength > SCIVERSE_REMOTE_IMAGE_MAX_BYTES) {
-    throw new Error('图片超过 20 MB。');
-  }
-  const bytes = new Uint8Array(await response.arrayBuffer());
-  if (bytes.byteLength === 0) throw new Error('图片内容为空。');
-  if (bytes.byteLength > SCIVERSE_REMOTE_IMAGE_MAX_BYTES) throw new Error('图片超过 20 MB。');
-  return (await saveNoteAssetBytes(
-    root,
-    entryId,
-    noteId,
-    imageMimeType(response.headers.get('content-type'), resolvedUrl),
-    bytesToBase64(bytes),
-    `sciverse-image-${imageIndex}`
-  )).markdown_path;
-}
-
-function resolveSciverseImageUrl(value: string, baseUrl?: string | null) {
-  if (value.startsWith('data:image/')) return value;
-  try {
-    const url = new URL(value, baseUrl ?? undefined);
-    return url.protocol === 'https:' || url.protocol === 'http:' ? url.toString() : null;
-  } catch {
-    return null;
-  }
-}
-
-function dataImagePayload(value: string) {
-  const match = /^data:(image\/(?:avif|gif|jpe?g|png|webp));base64,([a-z\d+/=]+)$/i.exec(value);
-  if (!match) throw new Error('不支持的内嵌图片格式。');
-  const estimatedSize = Math.floor((match[2].length * 3) / 4);
-  if (estimatedSize > SCIVERSE_REMOTE_IMAGE_MAX_BYTES) throw new Error('图片超过 20 MB。');
-  return { dataBase64: match[2], mimeType: match[1].toLowerCase() };
-}
-
-function imageMimeType(contentType: string | null, url: string) {
-  const normalized = contentType?.split(';', 1)[0].trim().toLowerCase();
-  if (normalized && ['image/avif', 'image/gif', 'image/jpeg', 'image/jpg', 'image/png', 'image/webp'].includes(normalized)) {
-    return normalized;
-  }
-  const extension = /\.([a-z\d]+)(?:$|[?#])/i.exec(url)?.[1]?.toLowerCase();
-  const byExtension: Record<string, string> = {
-    avif: 'image/avif', gif: 'image/gif', jpeg: 'image/jpeg', jpg: 'image/jpeg', png: 'image/png', webp: 'image/webp'
-  };
-  if (extension && byExtension[extension]) return byExtension[extension];
-  throw new Error(`不支持的图片类型：${contentType ?? '未知类型'}`);
-}
-
-function bytesToBase64(bytes: Uint8Array) {
-  const chunkSize = 0x8000;
-  let binary = '';
-  for (let start = 0; start < bytes.length; start += chunkSize) {
-    binary += String.fromCharCode(...bytes.subarray(start, start + chunkSize));
-  }
-  return btoa(binary);
-}
-
-async function replaceAsync(
-  value: string,
-  pattern: RegExp,
-  replacer: (...matches: string[]) => Promise<string>
-) {
-  const matches = [...value.matchAll(pattern)];
-  if (matches.length === 0) return value;
-  const replacements = await Promise.all(matches.map((match) => replacer(...match)));
-  let offset = 0;
-  return matches.reduce((result, match, index) => {
-    const start = match.index! + offset;
-    const replacement = replacements[index];
-    offset += replacement.length - match[0].length;
-    return `${result.slice(0, start)}${replacement}${result.slice(start + match[0].length)}`;
-  }, value);
-}
-
-function escapeHtmlAttribute(value: string) {
-  return value.replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;');
+  return localizeSciverseImages(markdown, async (reference) =>
+    (await saveSciverseNoteImage({ entryId, noteId, root, reference })).markdown_path);
 }
 
 function isHttpEndpoint(value: string) {
@@ -396,6 +240,8 @@ function isHttpEndpoint(value: string) {
 
 export function App() {
   const workspace = useWorkspace();
+  const onboardingRootRef = useRef(workspace.root);
+  onboardingRootRef.current = workspace.root;
   const { dismiss, notify } = useToast();
   const sciverseImportTasksRef = useRef(
     new Map<string, Promise<SciverseLibraryImportResult>>()
@@ -417,15 +263,21 @@ export function App() {
     }
     return window.localStorage.getItem(PARSER_API_KEY_STORAGE_KEY) ?? '';
   });
-  const [surfaceLayout, dispatchSurface] = useReducer(
-    workspaceSurfaceReducer,
-    initialWorkspaceSurfaceLayout
-  );
+  const [surfaceLayout, dispatchSurface] = useWorkspaceSession({
+    root: workspace.root, status: workspace.status, entries: workspace.entries, tags: workspace.tags,
+    onSaveError: () => notify({ tone: 'danger', title: '阅读会话未能保存', description: '当前阅读不受影响，但下次打开时可能无法恢复。' })
+  });
   const [workspaceSplitLeftWidth, setWorkspaceSplitLeftWidth] = useState<number | null>(
     readStoredWorkspaceSplitLeftWidth
   );
+  const openNewBrowserTab = useBrowserTabRequests(surfaceLayout, dispatchSurface, reason => notify({
+    tone: 'danger', title: reason === 'limit' ? '网页标签已达上限' : '无法打开链接',
+    description: reason === 'limit' ? '最多同时打开 8 个网页，请先关闭一个网页标签后重试。' : '只支持有效的外部 HTTP(S) 网页地址。'
+  }));
   const appShellRef = useRef<HTMLElement | null>(null);
   const workspaceSplitPreviewWidthRef = useRef<number | null>(workspaceSplitLeftWidth);
+  const workspaceSplitInitialWidthRef = useRef(workspaceSplitLeftWidth);
+  const workspaceSplitDesiredRatioRef = useRef<number | null>(readStoredWorkspaceSplitRatio());
   const [activeContentByEntryId, setActiveContentByEntryId] = useState<Record<string, string | null>>({});
   const [sidePane, setSidePane] = useState<SidePaneState>(EMPTY_SIDE_PANE);
   const [markdownNoteRefreshById, setMarkdownNoteRefreshById] = useState<Record<string, number>>({});
@@ -445,9 +297,10 @@ export function App() {
   const [sidebarOpen, setSidebarOpen] = useState(() => readStoredBoolean(SIDEBAR_OPEN_STORAGE_KEY, true));
   const [recentReadingEntryIds, setRecentReadingEntryIds] = useState<string[]>(readStoredRecentReading);
   const [sidebarWidth, setSidebarWidth] = useState(() => readStoredSidebarWidth());
-  const { previewWidth: sidebarResizePreviewWidth, effectiveWidth: effectiveSidebarWidth, maxWidth: sidebarMaxWidth,
+  const { previewRef: sidebarResizePreviewRef, effectiveWidth: effectiveSidebarWidth, maxWidth: sidebarMaxWidth,
     onPointerDown: startSidebarResize, onKeyDown: resizeSidebarWithKeyboard, observeContainer: observeSidebarContainer } = useSidebarResize({
     width: sidebarWidth, min: SIDEBAR_MIN_WIDTH, max: SIDEBAR_MAX_WIDTH, enabled: sidebarOpen, containerRef: appShellRef,
+    liveResize: surfaceLayout.left.kind === 'browser' || surfaceLayout.right?.kind === 'browser',
     onCommit: next => { setSidebarWidth(next); window.localStorage.setItem(SIDEBAR_WIDTH_STORAGE_KEY, String(next)); }
   });
   const [themePreset, setThemePreset] = useState<AppThemePresetId>(readStoredThemePreset);
@@ -467,6 +320,20 @@ export function App() {
     () => workspace.entries.map((entry) => toLibraryEntry(entry, tagPathById)),
     [tagPathById, workspace.entries]
   );
+  const taskEntryTitles = useMemo(() => Object.fromEntries(workspace.entries.map(entry => [entry.id, entry.title])), [workspace.entries]);
+  const parseQueue = usePdfParseQueue(workspace.status === 'ready' ? workspace.root : null,
+    mineruEndpoint, parserApiKey,
+    workspace.entries.map(entry => `${entry.id}:${entry.pdf?.parse.status}`).join('|'),
+    () => workspace.refreshEntries());
+  const pdfDropImport = usePdfDropImport({
+    workspaceRoot: workspace.root,
+    workspaceReady: workspace.status === 'ready',
+    parserEndpoint: mineruEndpoint,
+    parserApiKey,
+    createEntry: workspace.createLibraryEntry,
+    notify,
+    dismiss
+  });
   const hasActiveParseTasks = useMemo(
     () =>
       workspace.entries.some((entry) => {
@@ -495,24 +362,25 @@ export function App() {
     () => formatVectorStatus(vectorIndexStatus, vectorIndexError, vectorBuildStatus),
     [vectorBuildStatus, vectorIndexError, vectorIndexStatus]
   );
-  const { activeJobs, jobs: recentJobs } = useWorkspaceJobs(workspace.root);
+  const { jobs: recentJobs } = useWorkspaceJobs(workspace.root);
+  const localBackgroundJobs = useSyncExternalStore(subscribeLocalBackgroundJobs, getLocalBackgroundJobs);
+  const showAssistantTasks = useCallback(() => { setSidePanel('assistant'); setSidebarOpen(true); }, []);
+  const assistantTaskDock = useAssistantTaskDock(workspace.root, showAssistantTasks);
+  const scopedSciverseJobs = useMemo(() => sciverseBackgroundJobs.filter(job => job.scope?.root === workspace.root),
+    [sciverseBackgroundJobs, workspace.root]);
   const visibleBackgroundJobs = useMemo(
-    () => [...sciverseBackgroundJobs, ...recentJobs]
-      .sort((left, right) => right.updated_at.localeCompare(left.updated_at))
-      .slice(0, 8),
-    [recentJobs, sciverseBackgroundJobs]
+    () => workspaceTaskProjection(workspace.root, [...scopedSciverseJobs, ...recentJobs, ...localBackgroundJobs],
+      parseQueue.queue, parseQueue.configured, vectorBuildStatus, pdfDropImport.progress),
+    [workspace.root, recentJobs, scopedSciverseJobs, localBackgroundJobs, parseQueue.queue, parseQueue.configured, vectorBuildStatus, pdfDropImport.progress]
   );
-  const activeBackgroundJobCount = activeJobs.length + sciverseBackgroundJobs.filter(
-    (job) => job.status === 'queued' || job.status === 'processing'
-  ).length;
+  const activeBackgroundJobCount = visibleBackgroundJobs.filter(isRunningJob).length;
   const prepareWorkspaceChange = useCallback(async () => {
     if (activeBackgroundJobCount > 0) {
-      throw new Error('当前仍有解析、索引或翻译任务运行。请等待任务完成后再切换工作区。');
+      throw new Error('当前仍有论文添加、解析、索引或翻译任务运行。请等待任务完成后再切换工作区。');
     }
     await saveEditsBeforeWorkspaceChange();
   }, [activeBackgroundJobCount]);
   const resetWorkspaceUi = useCallback(() => {
-    dispatchSurface({ type: 'reset' });
     setActiveContentByEntryId({});
     setSidePane(EMPTY_SIDE_PANE);
     setMarkdownNoteRefreshById({});
@@ -562,11 +430,17 @@ export function App() {
     }
     const containerWidth = getWorkspaceSplitContainerWidth();
     const minimums = getWorkspaceSplitMinimums(surfaceLayout.left, rightSurface);
-    const nextWidth = clampWorkspaceSplitLeftWidth(
-      workspaceSplitLeftWidth ?? containerWidth / 2,
-      containerWidth,
-      minimums
-    );
+    const desiredRatio = workspaceSplitDesiredRatioRef.current ??
+      workspaceSplitLeftWidthFromRatio(
+        (workspaceSplitLeftWidth ?? containerWidth / 2) / containerWidth,
+        containerWidth,
+        minimums
+      ) / containerWidth;
+    const nextWidth = workspaceSplitLeftWidthFromRatio(desiredRatio, containerWidth, minimums);
+    if (workspaceSplitDesiredRatioRef.current === null) {
+      workspaceSplitDesiredRatioRef.current = desiredRatio;
+      window.localStorage.setItem(WORKSPACE_SPLIT_RATIO_STORAGE_KEY, String(desiredRatio));
+    }
     workspaceSplitPreviewWidthRef.current = nextWidth;
     setWorkspaceSplitLeftWidth(nextWidth);
   }, [surfaceLayout.left, surfaceLayout.right, workspaceSplitLeftWidth]);
@@ -603,29 +477,47 @@ export function App() {
       return undefined;
     }
 
-    const clampStoredWidth = () => {
+    const restorePreferredSplitWidth = () => {
       const containerWidth = split.getBoundingClientRect().width;
-      if (containerWidth <= 0) {
+      if (containerWidth <= 0 || !surfaceLayout.right) {
         return;
       }
-      setWorkspaceSplitLeftWidth((current) => {
-        if (current === null) {
-          return current;
-        }
-        if (!surfaceLayout.right) {
-          return current;
-        }
-        const minimums = getWorkspaceSplitMinimums(surfaceLayout.left, surfaceLayout.right);
-        const nextWidth = clampWorkspaceSplitLeftWidth(current, containerWidth, minimums);
-        workspaceSplitPreviewWidthRef.current = nextWidth;
-        return nextWidth;
-      });
+      const minimums = getWorkspaceSplitMinimums(surfaceLayout.left, surfaceLayout.right);
+      const desiredRatio = workspaceSplitDesiredRatioRef.current ??
+        workspaceSplitLeftWidthFromRatio(
+          (workspaceSplitInitialWidthRef.current ?? containerWidth / 2) / containerWidth,
+          containerWidth,
+          minimums
+        ) / containerWidth;
+      if (workspaceSplitDesiredRatioRef.current === null) {
+        workspaceSplitDesiredRatioRef.current = desiredRatio;
+        window.localStorage.setItem(WORKSPACE_SPLIT_RATIO_STORAGE_KEY, String(desiredRatio));
+      }
+      const nextWidth = workspaceSplitLeftWidthFromRatio(desiredRatio, containerWidth, minimums);
+      workspaceSplitPreviewWidthRef.current = nextWidth;
+      appShellRef.current?.style.setProperty('--app-workspace-left-width', `${nextWidth}px`);
+      setWorkspaceSplitLeftWidth(current => current === nextWidth ? current : nextWidth);
     };
 
-    clampStoredWidth();
-    const observer = new ResizeObserver(clampStoredWidth);
+    restorePreferredSplitWidth();
+    let resizeTimer: number | null = null;
+    const schedulePreferredSplitWidth = () => {
+      if (resizeTimer !== null) window.clearTimeout(resizeTimer);
+      // Native window restoration reports intermediate WebView widths. Keep
+      // the last paper/chat ratio until the new window geometry settles.
+      resizeTimer = window.setTimeout(() => {
+        resizeTimer = null;
+        restorePreferredSplitWidth();
+      }, 180);
+    };
+    const observer = new ResizeObserver(schedulePreferredSplitWidth);
     observer.observe(split);
-    return () => observer.disconnect();
+    window.addEventListener('focus', schedulePreferredSplitWidth);
+    return () => {
+      observer.disconnect();
+      window.removeEventListener('focus', schedulePreferredSplitWidth);
+      if (resizeTimer !== null) window.clearTimeout(resizeTimer);
+    };
   }, [surfaceLayout.left, surfaceLayout.right]);
 
   const trashedEntries = useMemo(
@@ -644,29 +536,8 @@ export function App() {
     sidebarOpen,
     sidePanel
   });
-  const activeEntryId = 'entryId' in focusedSurface ? focusedSurface.entryId : null;
-  const activeEntry = useMemo(
-    () => (activeEntryId ? entries.find((entry) => entry.id === activeEntryId) ?? null : null),
-    [activeEntryId, entries]
-  );
-  const activeAssistantSurface = useMemo<AssistantActiveSurfaceSnapshot>(() => {
-    const surfaceEntryId = 'entryId' in focusedSurface ? focusedSurface.entryId : null;
-    const focusedSegmentUid = 'segmentUid' in focusedSurface
-      ? focusedSurface.segmentUid ?? null
-      : (focusedSurface.kind === 'pdf' || focusedSurface.kind === 'reflow') &&
-        activeAssistantSegment?.entryId === surfaceEntryId
-        ? activeAssistantSegment.segmentUid
-        : null;
-    return {
-      capturedAt: new Date().toISOString(),
-      entryId: surfaceEntryId,
-      kind: focusedSurface.kind,
-      noteId: focusedSurface.kind === 'note' || focusedSurface.kind === 'note-review' ? focusedSurface.noteId ?? null : null,
-      pane: surfaceLayout.focusedPane,
-      segmentUid: focusedSegmentUid,
-      surfaceKey: surfaceKey(focusedSurface)
-    };
-  }, [activeAssistantSegment, focusedSurface, surfaceLayout.focusedPane]);
+  const { entry: activeEntry, note: activeAssistantNote, segment: activeAssistantSegmentForPanel, surface: activeAssistantSurface } = useMemo(
+    () => assistantSurfaceContext(surfaceLayout, entries, activeAssistantSegment), [surfaceLayout, entries, activeAssistantSegment]);
   const sidebarContext = resolveEntrySidebarContext(surfaceLayout);
   const sidebarNote = resolveTagNoteSidebarContext(surfaceLayout);
   const sidebarEntry = sidebarContext ? entries.find((entry) => entry.id === sidebarContext.entryId) ?? null : null;
@@ -674,42 +545,6 @@ export function App() {
   const readingContext = useSameTagContext(workspace.root, surfaceLayout, entries, workspace.tags, activeTag, sidebarOpen && sidePanel === 'same-tag' && workspace.status === 'ready');
   const sameTagId = readingContext.tagId;
   const activeContentId = entryContentId(focusedSurface);
-  const activeAssistantNote = useMemo<AssistantActiveNote | null>(() => {
-    const sidePaneNoteTarget = sidePane.target?.kind === 'markdown-note' ? sidePane.target : null;
-    const noteEntry = sidePaneNoteTarget
-      ? entries.find((entry) => entry.id === sidePaneNoteTarget.entryId) ?? null
-      : activeEntry;
-    if (!noteEntry) {
-      return null;
-    }
-
-    const noteId =
-      sidePaneNoteTarget?.noteId ??
-      (noteEntry.id === activeEntry?.id ? noteIdFromContentId(activeContentId) : null);
-    const note = noteId
-      ? noteEntry.contents.find(
-          (content) => content.kind === 'note' && content.note_id === noteId
-        )
-      : null;
-
-    if (!note) {
-      return null;
-    }
-
-    return {
-      entryId: noteEntry.id,
-      entryTitle: noteEntry.title,
-      noteId: note.note_id,
-      noteTitle: note.title
-    };
-  }, [activeContentId, activeEntry, entries, sidePane.target]);
-  const activeAssistantSegmentForPanel = useMemo(() => {
-    const panelEntry = activeEntry;
-    if (!panelEntry || activeAssistantSegment?.entryId !== panelEntry.id) {
-      return null;
-    }
-    return activeAssistantSegment;
-  }, [activeAssistantSegment, activeEntry, selectedEntry]);
   const openContentTabs = [];
 
 
@@ -950,6 +785,12 @@ export function App() {
     workspaceSplitPreviewWidthRef.current = width;
     setWorkspaceSplitLeftWidth(width);
     if (typeof window !== 'undefined') {
+      const containerWidth = getWorkspaceSplitContainerWidth();
+      if (containerWidth > 0) {
+        const ratio = width / containerWidth;
+        workspaceSplitDesiredRatioRef.current = ratio;
+        window.localStorage.setItem(WORKSPACE_SPLIT_RATIO_STORAGE_KEY, String(ratio));
+      }
       window.localStorage.setItem(WORKSPACE_SPLIT_WIDTH_STORAGE_KEY, String(width));
     }
   };
@@ -1146,6 +987,15 @@ export function App() {
     dispatchSurface({ type: 'open', surface: { kind: 'library' } });
   });
 
+  const fetchPdfForEntry = async (entryId: string) => {
+    const root = workspace.root;
+    const entry = workspace.entries.find(item => item.id === entryId);
+    if (!root || !entry) throw new Error('当前条目不可用，请重新打开后重试。');
+    await fetchEntryPdf(root, entryId, entry.title);
+    await workspace.refreshEntries(root);
+    notify({ title: 'PDF 已保存', description: '可以打开 PDF 阅读，需要重排内容时再开始解析。', tone: 'success' });
+  };
+
   const attachPdfToEntry = async (entryId: string, pdfPath: string) => {
     await workspace.importPdfForEntry(
       entryId,
@@ -1232,7 +1082,7 @@ export function App() {
     openEntryContentTab(entryId, nextContentId);
   };
 
-  const openAssistantSource = (source: ConversationSourceLink) => {
+  const openAssistantSource = (source: ConversationSourceLink, options?: { replyId: string }) => {
     if (isSciverseConversationSource(source)) {
       notify({
         tone: 'default',
@@ -1243,7 +1093,30 @@ export function App() {
       });
       return;
     }
-    openPdfSegment(source.entry_id, source.segment_uid, source.page_idx);
+    if (!entries.some(entry => entry.id === source.entry_id)) {
+      notify({ tone: 'default', title: '来源条目不可用', description: '来源条目已不在当前资料库中。' });
+      return;
+    }
+    const destination = assistantEvidenceNavigation(surfaceLayout, source, ++pdfJumpCounter.current, options?.replyId);
+    if (!openWorkspaceSurface(destination.surface, destination.pane)) return;
+    setPdfJumpByEntryId(current => ({ ...current, [source.entry_id]: destination.jump }));
+    workspace.setSelectedEntryId(source.entry_id);
+  };
+
+  const openAssistantContext = (item: AssistantContextInput) => {
+    if (item.kind === 'segment') {
+      openAssistantSource({ entry_id: item.entryId, entry_title: item.entryTitle,
+        segment_uid: item.segmentUid, page_idx: item.pageIdx, quote: item.text });
+      return;
+    }
+    const entry = entries.find(entry => entry.id === item.entryId);
+    const noteId = item.contentId?.replace(/^note:/, '');
+    if (!entry || (item.contentKind === 'note' && !entry.contents.some(content => content.kind === 'note' && content.note_id === noteId))) {
+      notify({ title: '引用资料不可用', description: '资料已不在当前资料库中，仍可查看已保存的引用详情。' });
+      return;
+    }
+    openEntryContentTab(item.entryId, item.contentKind === 'note' ? `note:${noteId}`
+      : item.contentKind === 'pdf' || item.contentKind === 'reflow' ? item.contentKind : 'overview');
   };
 
   const addSciversePaperToLibrary = (
@@ -1275,17 +1148,17 @@ export function App() {
             created_at: startedAt,
             error,
             id: jobId,
-            kind: 'llm',
+            kind: 'pdf_import',
             message,
-            progress: { current: status === 'processing' ? 1 : 2, percent: status === 'processing' ? 50 : 100, total: 2 },
+            progress: { current: status === 'succeeded' ? 1 : 0, percent: status === 'succeeded' ? 100 : 0, total: 1 },
             scope: workspace.root ? { kind: 'workspace', root: workspace.root } : null,
             status,
             updated_at: updatedAt
           };
-          return [nextJob, ...current.filter((job) => job.id !== jobId)].slice(0, 8);
+          return recentBackgroundJobs([nextJob, ...current.filter((job) => job.id !== jobId)], 24);
         });
       };
-      updateSciverseJob('processing', '正在保存到本地文库，可关闭论文详情页或切换标签。');
+      updateSciverseJob('processing', `正在添加：${source.title}，可关闭论文详情页或切换标签。`);
       try {
         if (!workspace.root) {
           throw new Error('当前未打开本地工作区，无法保存 Sciverse 论文。');
@@ -1302,6 +1175,7 @@ export function App() {
             pdfPath: existing.pdf ? workspaceEntryPdfPath(workspace.root, existing.id) : undefined,
             status: 'already_exists' as const
           };
+          updateSciverseJob('succeeded', `${source.title}：${importResult.message}`);
           notify({
             durationMs: 3000,
             title: 'Sciverse 论文已在本地文库',
@@ -1323,6 +1197,8 @@ export function App() {
           Object.entries({
             description: preparation.abstract ?? source.abstract ?? source.quote,
             来源平台: 'Sciverse',
+            'PDF 来源': preparation.pdf_source_url,
+            'PDF 获取方式': preparation.pdf_source_url ? '开放获取版本（可能与期刊排版不同）' : undefined,
             'Sciverse 文档 ID': source.doc_id,
             DOI: preparation.doi ?? source.doi,
             作者: preparation.authors.length
@@ -1368,8 +1244,7 @@ export function App() {
                 entryId: result.entryId,
                 markdown: buildSciverseRemoteContentMarkdown(source, remoteContent),
                 noteId: note.note_id,
-                root: workspace.root,
-                source
+                root: workspace.root
               });
               await updateNote(
                 workspace.root,
@@ -1381,25 +1256,26 @@ export function App() {
               remoteContentNoteTitle = noteTitle;
             }
           } catch (error) {
-            remoteContentError = error instanceof Error ? error.message : String(error);
+            remoteContentError = assistantErrorDiagnostic(error);
           }
         }
 
         const message = importedWithPdf
-          ? '已加入文库，并已提交 PDF 自动解析。'
+          ? '已加入文库并保存 PDF；解析状态请在条目详情中查看。'
           : remoteContentNoteTitle
             ? '未获取到 PDF，已创建条目并保存远程全文笔记。'
-            : `${preparation.degradation_reason ?? '已加入文库；当前仅保存外部来源元数据。'} 远程全文未能保存：${remoteContentError ?? '未知原因。'}`;
+            : formatAssistantError(remoteContentError, { debug: readAssistantDebug(),
+              fallback: '已加入文库，但仅保存了论文信息，未能获取 PDF 或远程全文。可以打开来源网页核对。' });
         notify({
           description: message,
           title: importedWithPdf
-            ? 'Sciverse 论文已加入并开始解析'
+            ? 'Sciverse 论文和 PDF 已保存'
             : remoteContentNoteTitle
               ? 'Sciverse 远程全文已保存'
               : 'Sciverse 论文已降级加入',
           tone: importedWithPdf || remoteContentNoteTitle ? 'success' : 'default'
         });
-        updateSciverseJob('succeeded', message);
+        updateSciverseJob('succeeded', `${source.title}：${message}`);
         return {
           entryId: result.entryId,
           message,
@@ -1413,14 +1289,14 @@ export function App() {
               : 'created_metadata_only' as const
         };
       } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
+        const message = formatAssistantError(error, { debug: readAssistantDebug(), fallback: ASSISTANT_IMPORT_INCOMPLETE });
         notify({
           durationMs: 6000,
           title: 'Sciverse 论文保存失败',
           description: message,
           tone: 'danger'
         });
-        updateSciverseJob('failed', message, message);
+        updateSciverseJob('failed', `${source.title}：${message}`, `${source.title}：${message}`);
         throw error;
       } finally {
         sciverseImportTasksRef.current.delete(source.doc_id);
@@ -1441,15 +1317,17 @@ export function App() {
         ? Math.max(0, target.page - 1)
         : 0;
     const entryId = target.sourceEntryId;
+    const destination = resolveSourceLinkSurface(surfaceLayout, entryId, target.originPane);
+    const targetSurfaceKey = surfaceKey(destination.surface);
     const requestKey = ++pdfJumpCounter.current;
     setPdfJumpByEntryId((current) => ({ ...current, [entryId]: target.segmentUid
-      ? { kind: 'segment', segmentUid: target.segmentUid, pageIdx, requestKey }
-      : { kind: 'page', pageIdx, requestKey } }));
-    if (!surfaceLayout.right) prepareWorkspaceSplit({ kind: 'pdf', entryId });
+      ? { kind: 'segment', segmentUid: target.segmentUid, pageIdx, requestKey, targetSurfaceKey }
+      : { kind: 'page', pageIdx, requestKey, targetSurfaceKey } }));
+    if (!surfaceLayout.right && destination.pane === 'right') prepareWorkspaceSplit(destination.surface);
     sourceLinkSurfaceActions(surfaceLayout, entryId, target.originPane).forEach(dispatchSurface);
   };
 
-  const openPdfSegment = (entryId: string, segmentUid: string, pageIdx: number) => {
+  const openPdfSegment = (entryId: string, segmentUid: string, pageIdx: number, pane?: WorkspacePaneId) => {
     const targetEntry = entries.find((entry) => entry.id === entryId) ?? null;
     if (!targetEntry) {
       return;
@@ -1465,7 +1343,7 @@ export function App() {
         requestKey: pdfJumpCounter.current
       }
     }));
-    openEntryContentTab(entryId, 'pdf');
+    openEntryContentTab(entryId, 'pdf', pane);
   };
 
   const openAnnotationRecord = (record: AnnotationCatalogRecord) => {
@@ -1906,6 +1784,30 @@ export function App() {
   return (
     <div className="app gap-0">
       <TitleBar onOpenSearch={() => setSearchDialogOpen(true)} />
+      {pdfDropImport.dragActive ? (
+        <div
+          aria-live="polite"
+          className="pointer-events-none fixed inset-3 grid place-items-center border-2 border-dashed border-primary"
+          role="status"
+          style={{ zIndex: 'var(--z-reader-preview)' }}
+        >
+          <div className="border border-border bg-popover px-4 py-3 text-sm font-medium text-popover-foreground shadow-sm">
+            {workspace.status === 'ready'
+              ? '松开以导入 PDF · 可同时拖入多个文件'
+              : '请先打开资料库，再拖入 PDF'}
+          </div>
+        </div>
+      ) : null}
+      {pdfDropImport.progress ? (
+        <div
+          aria-live="polite"
+          className="pointer-events-none fixed bottom-10 right-4 border border-border bg-popover px-3 py-2 text-xs text-popover-foreground shadow-sm"
+          role="status"
+          style={{ zIndex: 'var(--z-reader-preview)' }}
+        >
+          正在导入 PDF · {pdfDropImport.progress.completed}/{pdfDropImport.progress.total}
+        </div>
+      ) : null}
       <SearchDialog
         open={searchDialogOpen}
         root={workspace.root}
@@ -1943,26 +1845,43 @@ export function App() {
           </DialogFooter>
         </DialogContent>
       </Dialog>
+      <ResearchPaperActionsProvider key={workspace.root ?? 'no-workspace'} root={workspace.root}>
+      <AssistantReplyActionsContext.Provider value={{ root: workspace.root, openReply: message => {
+        openWorkspaceSurface({ kind: 'assistant-reply', message });
+      }, openSource: openAssistantSource, openContext: openAssistantContext, addSciverseSource: addSciversePaperToLibrary }}>
       <NoteReviewProvider key={workspace.root ?? 'no-workspace'}
         onOpen={({ proposal }) => openWorkspaceSurface({ kind: 'note-review', proposalId: proposal.id, label: proposal.title, entryId: proposal.entryId, noteId: proposal.noteId })}
         onShowAssistant={() => { setSidePanel('assistant'); setSidebarOpen(true); }}>
-      <WorkspaceNotesProvider root={workspace.root} refreshKey={JSON.stringify([
-        workspace.tags, entries.map((entry) => [entry.id, entry.updatedAt, entry.tagIds]),
-        trashedEntries.map((entry) => entry.id), markdownNoteRefreshById
-      ])}>
+      <WorkspaceNotesProvider root={workspace.root} refreshKey={noteCatalogRefreshKey(
+        workspace.tags, entries, trashedEntries, markdownNoteRefreshById
+      )}>
       <main
+        data-guide="reader-workspace"
         ref={observeSidebarContainer}
-        className={'app-shell ' + (sidebarResizePreviewWidth !== null ? 'is-sidebar-resizing' : '') + ' ' + (sidebarOpen ? '' : 'is-sidebar-collapsed')}
+        className={'app-shell ' + (sidebarOpen ? '' : 'is-sidebar-collapsed')}
         style={shellStyle}
       >
         <WorkspaceTabsBar
+          onNewBrowser={openNewBrowserTab}
           entries={entries}
           layout={surfaceLayout}
           onAddToAssistantContext={addWorkspaceSurfaceToAssistantContext}
           onClose={requestCloseSurfaceTab}
+          onDuplicate={(surface, pane) => dispatchSurface({ type: 'duplicate', key: surfaceKey(surface), pane, viewId: crypto.randomUUID() })}
           onCloseOthers={(pane, surface) => closeGuard.requestClose((pane === 'left' ? surfaceLayout.leftTabs : surfaceLayout.rightTabs)
-            .filter((tab) => surfaceKey(tab) !== surfaceKey(surface)).map((tab) => ({ pane, surface: tab })))}
+            .filter((tab) => surfaceKey(tab) !== surfaceKey(surface) && tab.kind !== 'library' && !surfaceLayout.pinnedTabKeys?.includes(surfaceKey(tab)))
+            .map((tab) => ({ pane, surface: tab })))}
+          onCloseToRight={(pane, surface) => {
+            const tabs = pane === 'left' ? surfaceLayout.leftTabs : surfaceLayout.rightTabs;
+            const index = tabs.findIndex((tab) => surfaceKey(tab) === surfaceKey(surface));
+            if (index < 0) return;
+            closeGuard.requestClose(tabs.slice(index + 1)
+              .filter((tab) => tab.kind !== 'library' && !surfaceLayout.pinnedTabKeys?.includes(surfaceKey(tab)))
+              .map((tab) => ({ pane, surface: tab })));
+          }}
           onClosePane={(pane) => closeGuard.requestClose((pane === 'left' ? surfaceLayout.leftTabs : surfaceLayout.rightTabs).map((surface) => ({ pane, surface })))}
+          onSetPinned={(surface, pinned) => dispatchSurface({ type: 'setPinned', key: surfaceKey(surface), pinned })}
+          onSwitchEntryView={(pane, surface, view) => dispatchSurface({ type: 'switchEntryView', pane, key: surfaceKey(surface), view })}
           onMove={(surface, pane, targetIndex) => {
             const sourcePane = surfaceLayout.leftTabs.some((tab) => surfaceKey(tab) === surfaceKey(surface)) ? 'left' : 'right';
             if (sourcePane !== pane && hasUnsavedSurface(surface)) {
@@ -1997,7 +1916,7 @@ export function App() {
             label={sidebarNote ? '笔记详情' : '条目详情'}
             onClick={() => toggleSidePanel('details')}
           >
-            <PanelRight size={18} aria-hidden="true" />
+            <AppearanceIcon kind="details"><PanelRight size={18} aria-hidden="true" /></AppearanceIcon>
           </ActivityButton>
           <ActivityButton
             active={activeActivityPanel === 'search'}
@@ -2035,7 +1954,16 @@ export function App() {
         ) : sidebarOpen && librarySidebarMode === 'empty-details' ? (
           <aside className="app-sidebar">
             <div className="side-head">条目详情</div>
-            <div className="p-3 text-xs leading-5 text-muted-foreground">打开条目或笔记后，可在这里查看详情。</div>
+            <Empty data-material="sidebar-empty" className="min-h-0 justify-start overflow-y-auto rounded-none px-5 py-6">
+              <EmptyHeader className="my-auto max-w-52 shrink-0 gap-3">
+                <EmptyMedia variant="icon" className="mb-0 size-12 bg-muted/60 text-muted-foreground/50" aria-hidden="true">
+                  <PanelRight className="size-6" strokeWidth={1.5} />
+                </EmptyMedia>
+                <EmptyDescription className="text-xs leading-6">
+                  打开条目或笔记后<br />可在这里查看详情
+                </EmptyDescription>
+              </EmptyHeader>
+            </Empty>
           </aside>
         ) : sidebarOpen && (librarySidebarMode === 'library' || librarySidebarMode === 'entry-details') ? (
           <LibrarySidebar
@@ -2045,6 +1973,9 @@ export function App() {
             activeContentId={sidebarContext?.contentId ?? null}
             entries={entries}
             trashItemCount={workspace.trashItems.length + workspace.tagArchiveCount}
+            parseQueue={<PdfParseQueuePanel controller={parseQueue}
+              onOpen={id => openWorkspaceSurface(entryContentSurface(id, 'pdf'))}
+              onRetry={id => workspace.retryPdfParseForEntry(id, mineruEndpoint, parserApiKey)} />}
             error={workspace.error}
             entryExplorerOpen={librarySidebarMode === 'entry-details'}
             recentReadingEntryIds={recentReadingEntryIds}
@@ -2150,16 +2081,16 @@ export function App() {
           onPointerDown={startSidebarResize}
         />
         ) : null}
-        {sidebarOpen && sidebarResizePreviewWidth !== null ? (
+        {sidebarOpen ? (
           <div
             aria-hidden="true"
             className="app-sidebar-resize-preview"
-            style={{
-              left: 'calc(var(--app-activity-width) + ' + sidebarResizePreviewWidth + 'px)'
-            }}
+            ref={sidebarResizePreviewRef}
+            hidden
           />
         ) : null}
         <ReaderPane
+          onUpdateBrowser={(id, url, title, metadata) => dispatchSurface({ type: 'updateBrowser', id, url, title, metadata })}
           onUpdateTagDescription={workspace.updateWorkspaceTagDescription}
           onOpenTrash={() => selectLibraryView('trash')}
           key={workspace.root ?? 'no-workspace'}
@@ -2274,6 +2205,7 @@ export function App() {
           onActiveSegmentChange={setActiveAssistantSegment}
           onApplyEntryTagPaths={workspace.applyEntryTagPaths}
           onUpdateEntry={workspace.updateWorkspaceEntry}
+          onFetchPdf={fetchPdfForEntry}
           onAttachPdf={attachPdfToEntry}
           onCreatePdfVersion={createPdfVersion}
           onImportMineruClientResult={workspace.importMineruClientResultForEntry}
@@ -2299,6 +2231,60 @@ export function App() {
       </main>
       </WorkspaceNotesProvider>
       </NoteReviewProvider>
+      </AssistantReplyActionsContext.Provider>
+      </ResearchPaperActionsProvider>
+      <OnboardingGuide root={workspace.root} ready={workspace.status === 'ready'} entries={workspace.entries}
+        selectedEntryId={workspace.selectedEntryId} layout={surfaceLayout}
+        onImportSample={async () => {
+          const root = workspace.root;
+          if (!root) throw new Error('请先打开资料库。');
+          const entry = await importOnboardingPaper(root);
+          await workspace.refreshEntries(root);
+          if (onboardingRootRef.current !== root) throw new Error('资料库已切换，演示资料保留在原资料库。请在当前资料库重新打开引导。');
+          return entry.id;
+        }}
+        onRoute={(route, entryId) => {
+          if (route === 'library') { setSidePanel('library'); setSidebarOpen(true); openWorkspaceSurface({ kind:'library' }); }
+          else if (route === 'library-sidebar') { setSidePanel('library'); setSidebarOpen(true); }
+          else if (route === 'search') { setSidePanel('search'); setSidebarOpen(true); }
+          else if (route === 'tag-reading') { setSidePanel('same-tag'); setSidebarOpen(true); }
+          else if (route === 'settings') openSettingsTab();
+          else if (route === 'create') openWorkspaceSurface({ kind:'create-entry' });
+          else if (route === 'mineru-guide') openWorkspaceSurface({ kind:'mineru-client-guide' });
+          else if (route === 'parser') openSetting('parser-service');
+          else if (route === 'parser-zip') openSetting('parser-zip');
+          else if (route === 'models') openSetting('models-connections');
+          else if (route === 'translation') openSetting('translation-model');
+          else if (route === 'onboarding-settings') openSetting('data-onboarding');
+          else if (route === 'note' && entryId) {
+            const notes = entries.find(entry => entry.id === entryId)?.contents ?? [];
+            const note = notes.slice().reverse().find(item => item.kind === 'note');
+            if (note?.kind === 'note') openEntryContentTab(entryId, `note:${note.note_id}`);
+            else { openEntryContentTab(entryId, 'overview'); setSidePanel('details'); setSidebarOpen(true); }
+          }
+          else if (route === 'pdf-note' && entryId) {
+            const notes = entries.find(entry => entry.id === entryId)?.contents ?? [];
+            const note = notes.slice().reverse().find(item => item.kind === 'note');
+            if (note?.kind === 'note') openMarkdownInPdfPane(entryId, note.note_id);
+            else { openEntryContentTab(entryId, 'overview'); setSidePanel('details'); setSidebarOpen(true); }
+          }
+          else if (route === 'split-pdf' && entryId) {
+            const leftPdf = surfaceLayout.left.kind === 'pdf' && surfaceLayout.left.entryId === entryId;
+            const rightPdf = surfaceLayout.right?.kind === 'pdf' && surfaceLayout.right.entryId === entryId;
+            if (!leftPdf && !rightPdf) {
+              const source = entryContentSurface(entryId, 'pdf');
+              openEntryContentTab(entryId, 'pdf', 'left');
+              dispatchSurface({ type:'duplicate', key:surfaceKey(source), pane:'right', viewId:crypto.randomUUID() });
+            } else if (!rightPdf && leftPdf) {
+              dispatchSurface({ type:'duplicate', key:surfaceKey(surfaceLayout.left), pane:'right', viewId:crypto.randomUUID() });
+            } else if (!leftPdf && rightPdf && surfaceLayout.right) {
+              dispatchSurface({ type:'duplicate', key:surfaceKey(surfaceLayout.right), pane:'left', viewId:crypto.randomUUID() });
+            }
+          }
+          else if ((route === 'pdf' || route === 'reflow') && entryId) openEntryContentTab(entryId, route);
+          else if (route === 'details' && entryId) { workspace.setSelectedEntryId(entryId); openEntryContentTab(entryId, 'overview'); setSidePanel('details'); setSidebarOpen(true); }
+          else if (route === 'assistant') { if (entryId) openEntryContentTab(entryId, 'pdf'); setSidePanel('assistant'); setSidebarOpen(true); }
+        }} />
       <footer className="statusbar">
         <AppearanceExit />
         <button type="button">侧栏</button>
@@ -2308,7 +2294,16 @@ export function App() {
         <span>{vectorStatusText}</span>
         <span>{entries.length} 个条目</span>
         <span>{selectedEntry?.title ?? '未选择条目'}</span>
-        <JobStatusDock activeCount={activeBackgroundJobCount} jobs={visibleBackgroundJobs} />
+        <JobStatusDock jobs={visibleBackgroundJobs} assistantTasks={assistantTaskDock.tasks} entryTitles={taskEntryTitles}
+          onOpenAssistantTask={assistantTaskDock.openTask} onStopAssistantTask={assistantTaskDock.stopTask}
+          onOpenJob={job => {
+            const scope = job.scope;
+            if (scope?.root !== workspace.root || scope.kind !== 'entry') return;
+            const entry = workspace.entries.find(item => item.id === scope.entry_id);
+            if (!entry) { notify({ title: '原条目已不可用', description: '请在条目库或回收站核对。' }); return; }
+            openEntryContentTab(entry.id, entry.pdf ? 'pdf' : 'overview');
+            if (job.kind === 'parser') { setSidePanel('library'); setSidebarOpen(true); }
+          }} />
         <button type="button">辅助栏</button>
       </footer>
     </div>

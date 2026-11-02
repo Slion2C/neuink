@@ -21,6 +21,14 @@ coverage/
 .vitest/
 .cache/
 
+# Local promotional exports and disposable visual checks.
+/output/
+/design-previews/seal-ui-alpha-v9/
+
+# Use the repository's npm workspaces and root package-lock.json.
+/apps/desktop/pnpm-lock.yaml
+/apps/desktop/pnpm-workspace.yaml
+
 # === Local Claude config (per-user permissions, not project config) ===
 .claude/
 
@@ -72,3 +80,14 @@ src-tauri/.cargo/
 **/resources/embedding-models/default/*
 !**/resources/embedding-models/default/README.md
 **/resources/embedding-models/**/.cache/
+
+# Locally supplied tutorial paper assets; publication permission remains separate.
+apps/desktop/src-tauri/resources/onboarding/attention-is-all-you-need.pdf
+apps/desktop/src-tauri/resources/onboarding/segments.json
+apps/desktop/src-tauri/resources/onboarding/mineru.zip
+apps/desktop/src-tauri/resources/onboarding-availability.json
+
+# Reproducible browser reader runtimes are installed by the explicit preparation script.
+apps/desktop/src-tauri/resources/browser-reader/
+apps/desktop/src-tauri/resources/.browser-reader-prepare-*/
+apps/desktop/src-tauri/resources/.browser-reader-backup-*/

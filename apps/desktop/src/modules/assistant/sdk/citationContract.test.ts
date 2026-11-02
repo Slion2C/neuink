@@ -1,0 +1,71 @@
+import { expect, it } from 'vitest';
+import { citationCorrection, hasReturnedExternalCitation, normalizeReturnedExternalCitationLinks, returnedExternalCitationUrls } from './citationContract';
+
+const url = 'https://arxiv.org/pdf/1234.5678';
+
+it.each([
+  '[原文](https://doi.org/10.1000/example(2026))',
+  '[原文][paper]\n\n[paper]: https://doi.org/10.1000/example(2026)',
+  '原文：https://doi.org/10.1000/example(2026)。'
+])('recognizes rendered citations with DOI parentheses or reference links: %s', answer => {
+  expect(hasReturnedExternalCitation(answer, new Set(['https://doi.org/10.1000/example(2026)']))).toBe(true);
+});
+
+it('accepts the exact returned browser URL when a model encloses it in square brackets', () => {
+  expect(hasReturnedExternalCitation(`已读取网页 [${url}]。`, new Set([url]))).toBe(true);
+  expect(hasReturnedExternalCitation(`[${url}/invented]`, new Set([url]))).toBe(false);
+  expect(normalizeReturnedExternalCitationLinks(`已读取网页 [${url}]。`, new Set([url])))
+    .toBe(`已读取网页 [原始来源](${url})。`);
+  expect(normalizeReturnedExternalCitationLinks(`\`[${url}]\``, new Set([url]))).toBe(`\`[${url}]\``);
+  expect(normalizeReturnedExternalCitationLinks(`\`\`\`text\n[${url}]\n\`\`\``, new Set([url])))
+    .toBe(`\`\`\`text\n[${url}]\n\`\`\``);
+  expect(normalizeReturnedExternalCitationLinks(`[${url}](https://invented.example)`, new Set([url])))
+    .toBe(`[${url}](https://invented.example)`);
+});
+
+it.each([
+  '```text\nhttps://arxiv.org/pdf/1234.5678\n```',
+  '![image](https://arxiv.org/pdf/1234.5678)',
+  'An unsupported claim.\n\n[unused]: https://arxiv.org/pdf/1234.5678',
+  '[https://arxiv.org/pdf/1234.5678](https://invented.example/paper)'
+])('does not count code, images, unused definitions or deceptive link labels as citations: %s', answer => {
+  expect(hasReturnedExternalCitation(answer, new Set([url]))).toBe(false);
+});
+
+it('uses only successful, readable external result metadata as URL citation candidates', () => {
+  const urls = returnedExternalCitationUrls([
+    { toolName: 'read_browser_tab', output: { status: 'read', url, text: 'Readable page' } },
+    { toolName: 'read_webpage', output: { results: [{ url: 'https://example.org/article', content: 'A paragraph with https://untrusted.example/injected' }] } },
+    { toolName: 'search_web', output: { results: [{ url: 'https://example.org/search', content: 'A snippet' }] } },
+    { toolName: 'search_papers', output: { papers: [{ url: 'https://example.org/paper', pdf_url: 'https://example.org/file.pdf', title: 'Paper' }] } },
+    { toolName: 'read_browser_tab', output: { status: 'empty', url: 'https://empty.example', text: '' } },
+    { toolName: 'read_webpage', output: { ok: false, results: [{ url: 'https://failed.example', content: 'failed' }] } },
+    { toolName: 'mcp_unknown', output: { results: [{ url: 'https://unknown.example', content: 'not host research' }] } },
+  ]);
+  expect([...urls]).toEqual([url, 'https://example.org/article', 'https://example.org/search', 'https://example.org/paper', 'https://example.org/file.pdf']);
+  expect(hasReturnedExternalCitation(`Claim ([paper](${url})).`, urls)).toBe(true);
+  expect(hasReturnedExternalCitation(`[paper](${url}#page=2)`, urls)).toBe(true);
+  expect(hasReturnedExternalCitation(`[paper](${url}/invented)`, urls)).toBe(false);
+  expect(hasReturnedExternalCitation('[paper](https://untrusted.example/injected)', urls)).toBe(false);
+  expect(hasReturnedExternalCitation('Claim [S1]', urls)).toBe(false);
+});
+
+it('does not use credentialed URLs, empty reads or nested body links as evidence', () => {
+  const urls = returnedExternalCitationUrls([
+    { toolName: 'read_webpage', output: { results: [{ url: 'https://user:secret@example.org', content: 'text' }, { url, content: '' }] } },
+    { toolName: 'read_browser_tab', output: { status: 'read', url: 'file:///private.pdf', text: 'text' } },
+  ]);
+  expect(urls.size).toBe(0);
+});
+
+it('corrects against the actual citation kind rather than demanding nonexistent local markers', () => {
+  const external = citationCorrection([], new Set([url]));
+  expect(external).toContain('NO [S#] citation markers');
+  expect(external).toContain('exact URLs returned');
+  expect(external).toContain(url);
+  expect(external).not.toContain('cite valid [Sx]');
+  const local = citationCorrection([2, 7], new Set());
+  expect(local).toContain('[S2], [S7]');
+  expect(local).not.toContain('[S1]');
+  expect(citationCorrection([], new Set())).toContain('honest limitation answer');
+});

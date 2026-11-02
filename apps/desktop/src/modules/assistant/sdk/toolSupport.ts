@@ -1,4 +1,14 @@
 import { jsonSchema, tool, type JSONSchema7, type ToolSet } from 'ai';
+import { isResearchTool, runResearchTool, researchPapersFromResult, ResearchImportNotApprovedError } from '@/shared/ipc/researchApi';
+import { assertSuccessfulToolResult, ToolPreconditionError } from './toolFailurePolicy';
+import { AgentToolNotExecutedError } from '../agent-core/agent';
+import { researchOutput } from './researchOutput';
+import { researchImportResult } from './researchImportResult';
+import { formatSciverseSearchOutput } from './sciverseOutput';
+export { formatSciverseSearchOutput } from './sciverseOutput';
+import { isPdfTool, runPdfTool } from './pdfTools';
+import { entryContextWindow, formatReadEntryOutput, ENTRY_CONTEXT_MAX_CHARS } from './entryContext';
+export { formatReadEntryOutput } from './entryContext';
 
 import type {
   AssistantContextSnapshot,
@@ -18,7 +28,7 @@ import type {
 } from '@/modules/sciverse/types';
 import {
   conversationSourceKey,
-  invokeAssistantTool,
+  invokeAssistantTool as invokeNativeTool,
   invokeMcpTool,
   isLocalConversationSource,
   listTools
@@ -176,6 +186,19 @@ export function normalizeToolInput(
 ) {
   const object = asObject(input);
 
+  if (isPdfTool(toolName)) {
+    const search = toolName === 'search_pdf_text';
+    const start = object.start_page ?? 1, count = object.page_count ?? (search ? 20 : 3);
+    if (!Number.isInteger(start) || Number(start) < 1 || Number(start) > 2000 || !Number.isInteger(count) || Number(count) < 1 || Number(count) > (search ? 20 : 5)) {
+      throw new Error('PDF 页码范围无效；读取每次最多 5 页，搜索最多 20 页。');
+    }
+    const query = search ? requiredString(object.query, 'query') : undefined;
+    if (query && query.length > 200) throw new Error('PDF 搜索词不能超过 200 个字符。');
+    return { root, entry_id: entryIdOrSingleScope(object.entry_id, scope), start_page: start, page_count: count, ...(query ? { query } : {}) };
+  }
+
+  if (isResearchTool(toolName)) return { ...object, root };
+
   if (toolName.startsWith('mcp.')) {
     return {
       args: object,
@@ -205,7 +228,8 @@ export function normalizeToolInput(
   if (toolName === 'read_entry_assistant_context') {
     return {
       root,
-      entry_id: entryIdOrSingleScope(object.entry_id, scope)
+      entry_id: entryIdOrSingleScope(object.entry_id, scope),
+      ...entryContextWindow(object)
     };
   }
 
@@ -267,21 +291,46 @@ export function mcpToolIdsForAgent(
     );
 }
 
+async function invokeAssistantTool<T>(name: string, input: JsonObject): Promise<T> {
+  const result = await invokeNativeTool<T>(name, input);
+  assertSuccessfulToolResult(result);
+  return result;
+}
+
 export async function executeTool(
   toolName: string,
   input: JsonObject,
   {
     addSource,
     signal,
-    contextBudget
+    contextBudget,
+    toolCallId
   }: {
     addSource: (source: ConversationSourceLink) => number;
     signal?: AbortSignal;
     contextBudget: number;
+    toolCallId?: string;
   }
 ) {
+  if (isPdfTool(toolName)) return runPdfTool(toolName, input, addSource, contextBudget, signal);
+  if (isResearchTool(toolName)) {
+    let result: unknown;
+    try { result = await runResearchTool(toolName, input, signal, toolCallId); }
+    catch (error) {
+      if (error instanceof ResearchImportNotApprovedError) {
+        throw new AgentToolNotExecutedError(error.message, 'TOOL_APPROVAL_UNAVAILABLE');
+      }
+      throw error;
+    }
+    assertSuccessfulToolResult(result);
+    if (toolName === 'import_papers') return researchImportResult(result, input.paper_ids);
+    return { modelOutput: researchOutput(result, contextBudget), sources: [], researchPapers: toolName === 'search_papers' ? researchPapersFromResult(result) : undefined,
+      summary: '已获取外部检索结果（不代表已读论文全文）。' };
+  }
   if (toolName.startsWith('mcp.')) {
     const result = await invokeMcpTool(toolName, input, signal);
+    assertSuccessfulToolResult(result);
+    assertSuccessfulToolResult(result.output);
     return {
       modelOutput: result.output ?? result,
       sources: [],
@@ -305,14 +354,20 @@ export async function executeTool(
   if (toolName === 'read_entry_assistant_context') {
     const result = await invokeAssistantTool<ReadEntryAssistantContextResponse>(
       'read_entry_assistant_context',
-      input
+      { root: input.root, entry_id: input.entry_id }
     );
-    return formatReadEntryOutput(result, addSource, contextBudget);
+    signal?.throwIfAborted();
+    if (result.has_pdf && result.parsed_segment_count === 0) {
+      const fallback = await runPdfTool('read_pdf_pages', { ...input, start_page: 1, page_count: 3 }, addSource, contextBudget, signal);
+      return { ...fallback, modelOutput: { ...fallback.modelOutput, requested_tool: 'read_entry_assistant_context',
+        note: 'PDF 尚未完整解析，已自动读取前 3 页以内的文字层；按 next_page 继续 read_pdf_pages，不能把这部分当成全文。' } };
+    }
+    return formatReadEntryOutput(result, addSource, contextBudget, input);
   }
 
   if (toolName === 'search_sciverse_evidence') {
     const result = await invokeAssistantTool<SciverseAgenticSearchResponse>(toolName, input);
-    return formatSciverseSearchOutput(result, addSource, String(input.query));
+    return formatSciverseSearchOutput(result, addSource, String(input.query), contextBudget);
   }
 
   if (toolName === 'read_sciverse_content') {
@@ -435,17 +490,22 @@ export function formatSearchSegmentsOutput(
       } satisfies ToolEvidence;
     });
 
+  // Backend warnings may embed provider errors and private model paths. Keep the
+  // successful evidence, but expose only host-owned degradation copy.
+  const keywordFallback = results.mode === 'semantic_fallback_keyword' || results.mode === 'hybrid_fallback_keyword';
+  const warnings = keywordFallback
+    ? ['Semantic search is unavailable. These are keyword fallback results, not semantic matches.']
+    : results.warnings?.length ? ['Search reported a limitation. Use only the returned evidence; completeness is not guaranteed.'] : [];
   const modelOutput = {
     evidence,
     kind: 'search_segments',
     mode: results.mode,
     query: results.query,
     total_hit_count: results.total_hit_count,
-    warnings: results.warnings ?? []
+    warnings
   };
 
-  const warningText =
-    (results.warnings ?? []).length > 0 ? ` ${results.warnings?.join(' ')}` : '';
+  const warningText = warnings.length > 0 ? ` ${warnings.join(' ')}` : '';
 
   return {
     modelOutput,
@@ -490,92 +550,6 @@ export function formatReadSegmentOutput(
   };
 }
 
-export function formatSciverseSearchOutput(
-  result: SciverseAgenticSearchResponse,
-  addSource: (source: ConversationSourceLink) => number,
-  query: string
-) {
-  const evidence = (result.hits ?? []).slice(0, 12).map((hit) => {
-    const source: ConversationSourceLink = {
-      provider: 'sciverse',
-      doc_id: hit.doc_id,
-      chunk_id: hit.chunk_id,
-      title: hit.title || 'Sciverse document',
-      quote: compactQuote(hit.chunk),
-      offset: hit.offset,
-      page_no: hit.page_no,
-      score: hit.score,
-      abstract: hit.abstract,
-      authors: hit.author,
-      publication_year: hit.publication_published_year,
-      venue: hit.publication_venue_name_unified,
-      citation_count: hit.citation_count,
-      primary_topic: hit.primary_topic,
-      doi: hit.doi,
-      access_is_oa: hit.access_is_oa,
-      access_oa_url: hit.access_oa_url,
-      access_license: hit.access_license,
-      source_type: hit.source_type,
-      resource_file_name: hit.file_name
-    };
-    const marker = addSource(source);
-    return {
-      chunk_id: hit.chunk_id,
-      doc_id: hit.doc_id,
-      marker: `[S${marker}]`,
-      offset: hit.offset,
-      page_no: hit.page_no,
-      score: hit.score,
-      snippet: hit.chunk,
-      title: source.title,
-      abstract: hit.abstract,
-      authors: hit.author,
-      publication_year: hit.publication_published_year,
-      venue: hit.publication_venue_name_unified,
-      citation_count: hit.citation_count,
-      primary_topic: hit.primary_topic,
-      doi: hit.doi,
-      access_is_oa: hit.access_is_oa,
-      access_oa_url: hit.access_oa_url,
-      access_license: hit.access_license,
-      source_type: hit.source_type,
-      resource_file_name: hit.file_name
-    };
-  });
-  return {
-    modelOutput: {
-      evidence,
-      kind: 'search_sciverse_evidence',
-      query,
-      source: 'sciverse'
-    },
-    sources: evidence.map((item) => ({
-      provider: 'sciverse' as const,
-      doc_id: item.doc_id,
-      chunk_id: item.chunk_id,
-      title: item.title,
-      quote: compactQuote(item.snippet),
-      offset: item.offset,
-      page_no: item.page_no,
-      score: item.score,
-      abstract: item.abstract,
-      authors: item.authors,
-      publication_year: item.publication_year,
-      venue: item.venue,
-      citation_count: item.citation_count,
-      primary_topic: item.primary_topic,
-      doi: item.doi,
-      access_is_oa: item.access_is_oa,
-      access_oa_url: item.access_oa_url,
-      access_license: item.access_license,
-      source_type: item.source_type,
-      resource_file_name: item.resource_file_name
-    })),
-    summary: evidence.length
-      ? `Found ${evidence.length} Sciverse evidence chunk${evidence.length === 1 ? '' : 's'} for "${query}".`
-      : `No Sciverse evidence matched "${query}".`
-  };
-}
 
 export function formatSciverseContentOutput(
   result: SciverseContentResponse,
@@ -608,49 +582,6 @@ export function formatSciverseContentOutput(
     },
     sources: [source],
     summary: `Read ${result.chars_returned} characters from Sciverse document ${source.doc_id}.`
-  };
-}
-
-export function formatReadEntryOutput(
-  result: ReadEntryAssistantContextResponse,
-  addSource: (source: ConversationSourceLink) => number,
-  contextBudget: number
-) {
-  const originalMarkerToMarker = new Map<number, number>();
-  const originalMarkerToSource = new Map<number, ConversationSourceLink>();
-  const trimmed = trimToBudget(result.markdown, contextBudget);
-  const markdown = trimmed.replace(/\[S(\d+)]/g, (full, markerText: string) => {
-    const originalMarker = Number(markerText);
-    const source = result.sources[originalMarker - 1];
-
-    if (!source) {
-      return full;
-    }
-
-    const existing = originalMarkerToMarker.get(originalMarker);
-    if (existing) {
-      return `[S${existing}]`;
-    }
-
-    const nextMarker = addSource(source);
-    originalMarkerToMarker.set(originalMarker, nextMarker);
-    originalMarkerToSource.set(originalMarker, source);
-    return `[S${nextMarker}]`;
-  });
-  const sources = [...originalMarkerToSource.values()];
-
-  return {
-    modelOutput: {
-      entry_id: result.entry_id,
-      entry_title: result.entry_title,
-      kind: 'read_entry_assistant_context',
-      markdown,
-      source_markers: [...originalMarkerToMarker.values()].map((marker) => `[S${marker}]`)
-    },
-    sources,
-    summary: result.markdown.trim()
-      ? `Read parsed markdown for ${result.entry_title} (${originalMarkerToMarker.size} source markers).`
-      : `${result.entry_title} has no parsed PDF markdown yet.`
   };
 }
 
@@ -890,7 +821,7 @@ export function buildNoteProposal(
     null;
 
   if (!entryId) {
-    throw new Error('A note proposal needs a target Entry.');
+    throw new ToolPreconditionError('note_target_required');
   }
   entryIdOrSingleScope(entryId, scope);
 
@@ -914,7 +845,7 @@ export function buildNoteProposal(
       : null;
 
   if (targetKind === 'segment_note' && !segmentUid) {
-    throw new Error('Segment note proposals need a target segment_uid.');
+    throw new ToolPreconditionError('note_target_required');
   }
 
   const noteId = targetKind === 'segment_note' || action === 'create'
@@ -922,7 +853,7 @@ export function buildNoteProposal(
     : optionalString(object.note_id) ?? plan?.target.noteId ?? currentNote?.noteId ?? null;
 
   if (targetKind === 'markdown_note' && action !== 'create' && !noteId) {
-    throw new Error('Prepend, append, and replace note proposals need a target note.');
+    throw new ToolPreconditionError('note_target_required');
   }
 
   const noteTitle =
@@ -950,14 +881,14 @@ export function buildNoteProposal(
       operation.type !== 'insert_lines'
     )
   ) {
-    throw new Error('This note task requires line-precise patch operations with expected_text.');
+    throw new ToolPreconditionError('patch_coordinates_required');
   }
   if (
     plan?.editCoordinatePolicy === 'line_and_hash' &&
     noteId &&
     !readNoteSnapshots.has(noteSnapshotKey(entryId, noteId))
   ) {
-    throw new Error('Read the current target note before creating a line-precise patch proposal.');
+    throw new ToolPreconditionError('note_read_required');
   }
   const citationMarkdown = action === 'patch' || action === 'delete'
     ? patchOperationsPreview(patchOperations ?? [])
@@ -1117,7 +1048,7 @@ export function applyMarkdownPatchPreview(
 
     if (operation.type === 'replace_exact') {
       if (countOccurrences(nextMarkdown, operation.oldText) !== 1) {
-        throw new Error('Patch replacement text must match exactly once.');
+        throw new ToolPreconditionError('patch_content_mismatch');
       }
       nextMarkdown = nextMarkdown.replace(operation.oldText, operation.newText);
       continue;
@@ -1134,7 +1065,7 @@ export function applyMarkdownPatchPreview(
 
     const matchCount = countOccurrences(nextMarkdown, operation.anchorText);
     if (matchCount !== 1) {
-      throw new Error('Patch anchor text must match exactly once.');
+      throw new ToolPreconditionError('patch_content_mismatch');
     }
 
     const index = nextMarkdown.indexOf(operation.anchorText);
@@ -1159,11 +1090,11 @@ function applyLinePatchPreview(
 
   if (operation.type === 'insert_lines') {
     if (operation.line > lines.length) {
-      throw new Error(`Patch line ${operation.line} is outside the current Markdown.`);
+      throw new ToolPreconditionError('patch_content_mismatch');
     }
     const currentLine = lines[operation.line - 1] ?? '';
     if (currentLine !== operation.expectedText) {
-      throw new Error(`Patch line ${operation.line} no longer matches expected_text.`);
+      throw new ToolPreconditionError('patch_content_mismatch');
     }
     const insertion = operation.text.replace(/\r\n/g, '\n').split('\n');
     const index = operation.position === 'before' ? operation.line - 1 : operation.line;
@@ -1172,15 +1103,11 @@ function applyLinePatchPreview(
   }
 
   if (operation.endLine < operation.startLine || operation.endLine > lines.length) {
-    throw new Error(
-      `Patch line range ${operation.startLine}-${operation.endLine} is outside the current Markdown.`
-    );
+    throw new ToolPreconditionError('patch_content_mismatch');
   }
   const currentText = lines.slice(operation.startLine - 1, operation.endLine).join('\n');
   if (currentText !== operation.expectedText.replace(/\r\n/g, '\n')) {
-    throw new Error(
-      `Patch line range ${operation.startLine}-${operation.endLine} no longer matches expected_text.`
-    );
+    throw new ToolPreconditionError('patch_content_mismatch');
   }
   const replacement = operation.type === 'replace_lines'
     ? operation.newText.replace(/\r\n/g, '\n').split('\n')
@@ -1483,7 +1410,7 @@ export function sourcesFromMarkers(
 
     const source = sourceByMarker.get(markerNumber);
     if (!source) throw new Error(`Unknown evidence marker: S${markerNumber}`);
-    if (!isLocalConversationSource(source)) throw new Error('External evidence cannot be persisted as a local Source Link. Import the paper before creating a linked note.');
+    if (!isLocalConversationSource(source)) throw new ToolPreconditionError('local_source_required');
 
     seen.add(markerNumber);
     sources.push({
@@ -1536,11 +1463,14 @@ export function modelInputSchema(descriptor: AssistantToolDescriptor): JSONSchem
     objectSchema.required = ['entry_id', 'segment_uid'];
   } else if (descriptor.name === 'read_entry_assistant_context') {
     objectSchema.required = ['entry_id'];
+    objectSchema.properties.offset = { type: 'integer', minimum: 0, description: 'Start at 0. For continuation, copy the exact next_read returned by this tool.' };
+    objectSchema.properties.limit = { type: 'integer', minimum: 100, maximum: ENTRY_CONTEXT_MAX_CHARS, description: 'Maximum characters per parsed-text chunk; defaults to 8000.' };
+    objectSchema.properties.revision = { type: 'string', pattern: '^[a-f0-9]{8}$', description: 'For offset > 0, copy revision from next_read so changed content cannot be silently mixed.' };
   } else {
     objectSchema.required = (objectSchema.required ?? []).filter((key: string) => key !== 'root');
   }
 
-  describeProperty(objectSchema, 'query', 'Search phrase or question to locate relevant PDF segments.');
+  describeProperty(objectSchema, 'query', 'Search phrase or question. Use a concise query relevant to this tool.');
   describeProperty(objectSchema, 'mode', 'Search mode. Prefer hybrid for content lookup; use keyword for exact terms.');
   describeProperty(objectSchema, 'scope_entry_ids', 'Optional Entry ids. Omit this to use the current Neuink scope.');
   describeProperty(objectSchema, 'top_k', 'Optional maximum number of segment hits to return.');
@@ -1548,7 +1478,9 @@ export function modelInputSchema(descriptor: AssistantToolDescriptor): JSONSchem
   describeProperty(objectSchema, 'segment_uid', 'Segment uid returned by search_segments.');
   describeProperty(objectSchema, 'doc_id', 'Sciverse document id returned by search_sciverse_evidence.');
   describeProperty(objectSchema, 'offset', 'Optional Unicode character offset for Sciverse content.');
-  describeProperty(objectSchema, 'limit', 'Maximum Sciverse content characters to read.');
+  describeProperty(objectSchema, 'limit', descriptor.name === 'search_papers'
+    ? 'Maximum number of papers, an integer from 1 to 10. Use limit, not top_k.'
+    : 'Maximum content characters to read.');
   describeProperty(objectSchema, 'title', 'Optional Sciverse paper title from the search result.');
   describeProperty(objectSchema, 'chunk_id', 'Optional Sciverse chunk id from the search result.');
   describeProperty(objectSchema, 'page_no', 'Optional Sciverse page number from the search result.');
@@ -1587,7 +1519,7 @@ export function toolDescription(descriptor: AssistantToolDescriptor) {
     return `${descriptor.description} Use this after search_segments when a snippet is not enough.`;
   }
   if (descriptor.name === 'read_entry_assistant_context') {
-    return `${descriptor.description} Use this only for an explicitly selected, named, or confirmed Entry.`;
+    return `${descriptor.description} Use this only for an explicitly selected, named, or confirmed Entry. Omit limit for the default 8000 characters; if supplied, limit must be between 100 and ${ENTRY_CONTEXT_MAX_CHARS}. Parsed text is returned in bounded chunks: when more is true, call this tool again with the returned next_read arguments. Read all chunks when full reading is requested; otherwise state partial coverage. Never read CLI tool-result files with native Read/shell to obtain the rest. If no parsed segments exist, the host reads up to the first 3 PDF text-layer pages automatically. Continue with read_pdf_pages / search_pdf_text; respect next_page and incomplete/OCR warnings.`;
   }
   if (descriptor.name === 'search_sciverse_evidence') {
     return `${descriptor.description} Preserve every returned marker and source identifier in the answer.`;
@@ -1602,7 +1534,7 @@ export function scopedEntryIds(value: unknown, scope: ScopeSnapshot) {
   const requested = stringArray(value);
 
   if (scope.entry_ids.length === 0) {
-    return requested;
+    throw new Error('当前冻结范围没有可检索条目，请先选择论文或调整范围。');
   }
 
   if (requested.length === 0) {
@@ -1610,8 +1542,10 @@ export function scopedEntryIds(value: unknown, scope: ScopeSnapshot) {
   }
 
   const allowed = new Set(scope.entry_ids);
-  const filtered = requested.filter((entryId) => allowed.has(entryId));
-  return filtered.length > 0 ? filtered : scope.entry_ids;
+  if (requested.some(entryId => !allowed.has(entryId))) {
+    throw new Error('检索条目超出冻结范围，不能自动扩大到其他论文。');
+  }
+  return requested;
 }
 
 export function entryIdOrSingleScope(value: unknown, scope: ScopeSnapshot) {
@@ -1647,6 +1581,7 @@ export function searchMode(value: unknown) {
 }
 
 export function runningSummary(toolName: string, input: JsonObject) {
+  if (isPdfTool(toolName)) return toolName === 'search_pdf_text' ? '正在搜索 PDF 文字层…' : '正在按页读取 PDF 文字层…';
   if (toolName === 'search_segments') {
     return `Searching parsed PDF segments for "${String(input.query)}" using ${String(input.mode)}.`;
   }
@@ -1777,14 +1712,22 @@ export function trimToBudget(text: string, budget: number) {
 
 export function trimSciverseJson(value: SciverseJsonResponse, budget: number) {
   const text = JSON.stringify(value);
-  if (text.length <= Math.min(16_000, budget)) {
+  const limit = Math.min(16_000, Math.floor(budget));
+  if (text.length <= limit) {
     return value;
   }
-  return {
-    ...value,
-    _neuink_truncated: true,
-    _neuink_preview: trimToBudget(text, Math.min(16_000, budget))
-  };
+  // Do not spread the original response back into a supposedly truncated result.
+  // Account for JSON escaping as well as the wrapper, including quotes/newlines in schemas.
+  const wrap = (length: number) => ({ _neuink_truncated: true, _neuink_preview: text.slice(0, length) });
+  if (limit < JSON.stringify(wrap(0)).length) throw new Error('Sciverse context budget is too small.');
+  let low = 0;
+  let high = Math.min(text.length, limit);
+  while (low < high) {
+    const mid = Math.ceil((low + high) / 2);
+    if (JSON.stringify(wrap(mid)).length <= limit) low = mid;
+    else high = mid - 1;
+  }
+  return wrap(low);
 }
 
 export function errorMessage(error: unknown) {

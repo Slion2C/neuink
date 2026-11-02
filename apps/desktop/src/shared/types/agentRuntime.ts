@@ -1,4 +1,11 @@
 export type AgentToolId =
+  | 'read_pdf_pages'
+  | 'search_pdf_text'
+  | 'search_papers'
+  | 'search_web'
+  | 'read_webpage'
+  | 'read_browser_tab'
+  | 'import_papers'
   | 'app.set_appearance'
   | 'create_entry'
   | 'search_segments'
@@ -98,6 +105,7 @@ export type SubagentProfile = AgentBaseProfile & {
 export type AgentProfile = MainAssistantProfile | SubagentProfile;
 
 export type AgentRuntimeSettings = {
+  capabilityRevision?: number;
   mainAssistant: MainAssistantProfile;
   mcpServers: AgentMcpServer[];
   subagents: SubagentProfile[];

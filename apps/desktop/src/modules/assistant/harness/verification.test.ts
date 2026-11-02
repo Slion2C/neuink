@@ -35,7 +35,34 @@ const snapshot = {
   warnings: []
 } as unknown as AssistantContextSnapshot;
 
+it.each([false, true])('retains host-verified external citations without relaxing source policy after failures: %s', hadRecoverableFailures => {
+  const grounded = { answer: '根据[原文](https://example.org/paper)。', sources: [], externalCitationUrls: ['https://example.org/paper'], hadRecoverableFailures };
+  const plan = { ...notePlan(false), needsNoteProposal: false, deliverables: ['chat_answer'] as AssistantTaskPlan['deliverables'], citationPolicy: 'required' as const };
+  const verify = (sourcePolicy: AgentInvocationPlan['sourcePolicy']) => verifyHarnessResult({
+    activeExecution, grounded, invocationPlan: { ...invocationPlan, sourcePolicy }, plan, snapshot
+  });
+  expect(verify('mixed').errors).toEqual([]);
+  expect(verify('workspace_only').errors).toContain('The task required workspace-only evidence, but an external source was included.');
+  expect(verify('sciverse_only').errors.length).toBeGreaterThan(0);
+  expect(verifyHarnessResult({ activeExecution, grounded: { ...grounded, hadRecoverableFailures: false, externalCitationUrls: [] }, invocationPlan, plan, snapshot }).errors.length).toBeGreaterThan(0);
+});
+
 describe('verifyHarnessResult note citations', () => {
+  it('keeps a failure explanation instead of rejecting missing deliverables again at delivery', () => {
+    const grounded: GroundedAnswer = { answer: '读取失败，没有足够证据生成笔记。', sources: [], hadRecoverableFailures: true };
+    const plan = { ...notePlan(true), deliverables: ['chat_answer', 'note_patch_proposal'] as AssistantTaskPlan['deliverables'] };
+    const result = verifyHarnessResult({ activeExecution, grounded, invocationPlan: { ...invocationPlan, sourcePolicy: 'sciverse_only' }, plan, snapshot });
+    expect(result.errors).toEqual([]); expect(result.warnings.length).toBeGreaterThan(0);
+    expect(verifyHarnessResult({ activeExecution, grounded: { ...grounded, hadRecoverableFailures: false }, invocationPlan, plan, snapshot }).errors.length).toBeGreaterThan(0);
+  });
+  it('never relaxes actual proposal citations or source authorization because a tool failed', () => {
+    const grounded = { ...groundedProposal(), hadRecoverableFailures: true };
+    expect(verifyHarnessResult({ activeExecution, grounded, invocationPlan, plan: notePlan(true), snapshot }).errors)
+      .toContain('A paper-grounded note proposal was produced without a valid source citation.');
+    grounded.sources = [{ entry_id: 'entry-1', entry_title: 'Paper', segment_uid: 's1', page_idx: 0, quote: 'data' }];
+    expect(verifyHarnessResult({ activeExecution, grounded, invocationPlan: { ...invocationPlan, sourcePolicy: 'sciverse_only' }, plan: notePlan(true), snapshot }).errors)
+      .toContain('The task required Sciverse-only evidence, but the final sources did not satisfy that policy.');
+  });
   it('allows a general-knowledge append when an unrelated paper is open', () => {
     expect(verifyHarnessResult({
       activeExecution,

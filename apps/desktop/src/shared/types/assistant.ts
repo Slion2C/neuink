@@ -323,7 +323,7 @@ export type AgentInvocationPlan = {
   responseStyle?: 'lightweight_chat';
   executionMode?: 'act' | 'plan';
   enabledToolIds: string[];
-  failurePolicy?: 'stop';
+  failurePolicy?: 'stop' | 'report_to_agent';
   missing: string[];
   mode: AssistantInvocationMode;
   noteEditMode?: AssistantNoteEditMode;
@@ -391,17 +391,22 @@ export type AssistantActiveSegment = {
   entryTitle: string;
   pageIdx: number;
   segmentUid: string;
+  sentenceIndex?: number;
   text: string;
 };
 
 export type AssistantActiveSurfaceSnapshot = {
+  /** Frozen host-selected document, read on demand; never includes page body. */
+  browserTab?: import('@/shared/ipc/browserApi').BrowserTabTarget;
   capturedAt: string;
   entryId: EntryId | null;
   kind:
     | 'annotations'
+    | 'browser'
     | 'create-entry'
     | 'mineru-client-guide'
     | 'note-review'
+    | 'assistant-reply'
     | 'entry-overview'
     | 'entry-trash'
     | 'library'

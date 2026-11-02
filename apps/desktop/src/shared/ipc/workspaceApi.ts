@@ -1,4 +1,6 @@
 import { invoke } from '@tauri-apps/api/core';
+import { runLocalBackgroundJob } from '../lib/localBackgroundJobs';
+import { noteMutation, SEGMENT_BOOKMARK_CHANGED } from './noteCatalogApi';
 
 import type {
   EntryId,
@@ -144,6 +146,8 @@ export type OpenDevWorkspaceResponse = {
 };
 
 export type WorkspaceSettings = {
+  data_root?: string | null;
+  legacy_import_notice?: string | null;
   default_root: string;
   root: string;
   custom_root: string | null;
@@ -174,12 +178,6 @@ export type TranslationAutomationSettings = {
   segment_types: string[];
 };
 
-export type MigrateWorkspaceRootResponse = {
-  from_root: string;
-  root: string;
-  restart_requested: boolean;
-};
-
 export async function openDevWorkspace(): Promise<OpenDevWorkspaceResponse> {
   return invoke<OpenDevWorkspaceResponse>('open_dev_workspace');
 }
@@ -208,12 +206,6 @@ export async function updateTranslationAutomationSettings(
 
 export async function setWorkspaceRoot(root: string): Promise<OpenDevWorkspaceResponse> {
   return invoke<OpenDevWorkspaceResponse>('set_workspace_root', {
-    request: { root }
-  });
-}
-
-export async function migrateWorkspaceRoot(root: string): Promise<MigrateWorkspaceRootResponse> {
-  return invoke<MigrateWorkspaceRootResponse>('migrate_workspace_root', {
     request: { root }
   });
 }
@@ -294,6 +286,16 @@ export async function updateEntryMeta(
       fields,
       tags
     }
+  });
+}
+
+export async function applyEntryTagPaths(
+  root: string,
+  entryId: EntryId,
+  paths: string[]
+): Promise<{ entry: EntryMeta; tags: TagMeta[] }> {
+  return invoke('apply_entry_tag_paths', {
+    request: { root, entry_id: entryId, paths }
   });
 }
 
@@ -646,9 +648,11 @@ export type RefreshParseStatusResponse = {
 };
 
 export async function setSegmentNoteBookmark(root: string, entryId: string, segmentUid: string, bookmarked: boolean) {
-  return invoke<SegmentBlockNote[]>('set_segment_note_bookmark', {
+  const notes = await noteMutation(root, invoke<SegmentBlockNote[]>('set_segment_note_bookmark', {
     request: { root, entry_id: entryId, segment_uid: segmentUid, bookmarked }
-  });
+  }));
+  if (typeof window !== 'undefined') window.dispatchEvent(new CustomEvent(SEGMENT_BOOKMARK_CHANGED, { detail: { root, entryId } }));
+  return notes;
 }
 
 export type PdfReaderResponse = {
@@ -677,7 +681,7 @@ export type AnnotationCatalogRecord = {
   segment_status: 'current' | 'page_anchored' | 'orphaned' | 'missing';
 };
 
-export type TranslationStatus = 'idle' | 'running' | 'succeeded' | 'failed' | 'partial';
+export type TranslationStatus = 'idle' | 'running' | 'succeeded' | 'failed' | 'partial' | 'paused' | 'canceled';
 
 export type TranslatedSegmentStatus = 'pending' | 'translated' | 'skipped' | 'failed';
 
@@ -713,6 +717,7 @@ export type TranslatedSegment = {
 };
 
 export type EntryTranslation = {
+  task?: { job_id: string; profile_id: string; force: boolean; source_hashes: Record<string, string>; remaining_segment_uids: string[]; created_at: string } | null;
   created_at: string;
   entry_id: EntryId;
   error: string | null;
@@ -740,7 +745,7 @@ export type JobKind =
   | 'vectorize'
   | 'llm';
 
-export type JobStatus = 'queued' | 'processing' | 'succeeded' | 'failed' | 'canceled';
+export type JobStatus = 'queued' | 'processing' | 'paused' | 'succeeded' | 'failed' | 'canceled';
 
 // Rust 侧 JobScope 用内部标签 + 扁平字段序列化：
 // {"kind":"entry","root":...,"entry_id":...} / {"kind":"workspace","root":...}
@@ -769,7 +774,7 @@ export type Job = {
 export type JobEvent = {
   emitted_at: string;
   job: Job;
-  kind: 'queued' | 'started' | 'progress' | 'succeeded' | 'failed' | 'canceled';
+  kind: 'queued' | 'started' | 'progress' | 'paused' | 'succeeded' | 'failed' | 'canceled';
   payload: unknown;
 };
 
@@ -799,13 +804,15 @@ export async function importAndParsePdf(
 export async function queuePdfParse(
   root: string,
   entryId: EntryId,
-  pdfPath: string
+  pdfPath: string,
+  enqueue = true
 ): Promise<EntryMeta> {
   return invoke<EntryMeta>('queue_pdf_parse', {
     request: {
       root,
       entry_id: entryId,
-      pdf_path: pdfPath
+      pdf_path: pdfPath,
+      enqueue
     }
   });
 }
@@ -950,9 +957,31 @@ export async function translateEntrySegment(
   entryId: EntryId,
   segmentUid: string
 ): Promise<EntryTranslationResponse> {
-  return invoke<EntryTranslationResponse>('translate_entry_segment', {
-    request: { root, entry_id: entryId, segment_uid: segmentUid }
+  return runLocalBackgroundJob({
+    idPrefix: 'single-segment-translation',
+    kind: 'paragraph_translation',
+    scope: { kind: 'entry', root, entry_id: entryId },
+    message: '正在翻译片段',
+    successMessage: '片段翻译完成',
+    failureMessage: '片段翻译未完成，请返回论文重试。'
+  }, async () => {
+    const response = await invoke<EntryTranslationResponse>('translate_entry_segment', {
+      request: { root, entry_id: entryId, segment_uid: segmentUid }
+    });
+    const segment = response.translation?.segments.find(item => item.segment_uid === segmentUid);
+    if (!segment || segment.status !== 'translated' || !segment.translated_text?.trim()) {
+      throw new Error('片段翻译未返回有效译文，请返回论文重试。');
+    }
+    return response;
   });
+}
+
+export async function resumeEntryTranslation(root: string, entryId: string, jobId: string): Promise<RunEntryTranslationResponse> {
+  return invoke('resume_entry_translation', { request: { root, entry_id: entryId, job_id: jobId } });
+}
+
+export async function cancelTranslationTask(root: string, entryId: string, jobId: string): Promise<RunEntryTranslationResponse> {
+  return invoke('cancel_translation_task', { request: { root, entry_id: entryId, job_id: jobId } });
 }
 
 export async function pauseEntryTranslation(jobId: string): Promise<Job | null> {
@@ -1067,14 +1096,14 @@ export async function upsertSegmentNote(
   segmentUid: string,
   text: string
 ): Promise<SegmentBlockNote[]> {
-  return invoke<SegmentBlockNote[]>('upsert_segment_note', {
+  return noteMutation(root, invoke<SegmentBlockNote[]>('upsert_segment_note', {
     request: {
       root,
       entry_id: entryId,
       segment_uid: segmentUid,
       text
     }
-  });
+  }));
 }
 
 export async function listAnnotations(root: string): Promise<AnnotationCatalogRecord[]> {
@@ -1204,13 +1233,13 @@ export async function deleteSegmentNote(
   entryId: EntryId,
   segmentUid: string
 ): Promise<SegmentBlockNote[]> {
-  return invoke<SegmentBlockNote[]>('delete_segment_note', {
+  return noteMutation(root, invoke<SegmentBlockNote[]>('delete_segment_note', {
     request: {
       root,
       entry_id: entryId,
       segment_uid: segmentUid
     }
-  });
+  }));
 }
 
 export async function getSearchIndexBuildStatus(

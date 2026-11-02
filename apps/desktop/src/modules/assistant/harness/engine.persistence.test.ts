@@ -9,6 +9,7 @@ import { createNeuinkModel } from '../sdk/provider';
 import { scriptedModel } from '../sdk/testHelpers/model';
 import { readNote } from '@/shared/ipc/workspaceApi';
 import { getAssistantRouteSignals } from '@/shared/ipc/assistantRoutingApi';
+import { ASSISTANT_MODEL_BILLING_ERROR } from '@/shared/lib/assistantModelErrors';
 vi.mock('@/shared/ipc/assistantRoutingApi', () => ({ getAssistantRouteSignals: vi.fn(async () => ({ status: 'unavailable', scores: [] })) }));
 
 vi.mock('../sdk/provider', () => ({ createNeuinkModel: vi.fn(), generationSettings: () => ({}) }));
@@ -46,6 +47,29 @@ beforeEach(() => {
 });
 
 describe('real harness wiring (only model and IPC transports are replaced)', () => {
+  it('keeps provider billing failures actionable without persisting the remote error body', async () => {
+    const model = scriptedModel([]);
+    model.doStream = vi.fn().mockRejectedValue(Object.assign(new Error('private-provider-body'), { statusCode: 402 }));
+    vi.mocked(createNeuinkModel).mockReturnValue(model);
+    await expect(runAssistantHarness(options)).rejects.toThrow(ASSISTANT_MODEL_BILLING_ERROR);
+    expect(stored.status).toBe('failed');
+    expect(JSON.stringify(stored)).not.toContain('private-provider-body');
+    expect(invokeAssistantTool).not.toHaveBeenCalled();
+  });
+  it('delivers and saves the parent answer after a failed read without failing the conversation', async () => {
+    vi.mocked(createNeuinkModel).mockReturnValue(scriptedModel([
+      { call: { name: 'read_segment_content', args: { entry_id: 'entry', segment_uid: 's1' } } },
+      { text: '读取失败，无法确认该论文内容。' }
+    ]));
+    vi.mocked(invokeAssistantTool).mockRejectedValue(new Error('file unavailable'));
+    const answer = await runAssistantHarness({ ...options, scope: { ...options.scope, entry_ids: ['entry'], entry_titles: ['Paper'] } });
+    expect(answer.answer).toContain('无法确认');
+    expect(answer.hadRecoverableFailures).toBe(true);
+    expect(answer.taskState?.status).toBe('completed');
+    expect(answer.toolEvents).toContainEqual(expect.objectContaining({ toolName: 'read_segment_content', status: 'error' }));
+    await acknowledgeExecution(options.root, answer.executionId!, false);
+    expect(stored.status).toBe('completed');
+  });
   it('persists and resumes the main Agent response without a planner, memory call or duplicate model request', async () => {
     const answer = await runAssistantHarness(options);
     expect(answer.answer).toContain('选择');
@@ -147,6 +171,8 @@ describe('real harness wiring (only model and IPC transports are replaced)', () 
     vi.mocked(createNeuinkModel).mockReturnValue(model);
     const answer = await runAssistantHarness({ ...options, scope: { ...options.scope, entry_ids: ['entry'], entry_titles: ['Paper'] } });
     expect(JSON.stringify(model.doStreamCalls[1].prompt)).toContain('Read the current target note');
+    expect(JSON.stringify(model.doStreamCalls[1].prompt)).toContain('TOOL_PREFLIGHT_FAILED');
+    expect(JSON.stringify(model.doStreamCalls[1].prompt)).toContain('not_executed');
     expect(readNote).toHaveBeenCalledOnce();
     expect(answer.noteProposals).toHaveLength(1);
     expect(answer.noteProposals?.[0]).toMatchObject({ action: 'patch', beforeMarkdown: 'Old\n', afterMarkdown: 'New\n', status: 'pending' });

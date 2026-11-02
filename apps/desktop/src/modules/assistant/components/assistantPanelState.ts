@@ -396,6 +396,7 @@ export function buildAssistantMessageParts({
   for (const event of toolEvents) {
     parts.push({
       args: event.input,
+      recovered: event.recovered,
       id: event.id,
       status: event.status,
       toolName: event.toolName,
@@ -405,7 +406,9 @@ export function buildAssistantMessageParts({
     if (event.summary) {
       parts.push({
         id: event.id,
+        diagram: event.diagram,
         sourceLinks: event.sources,
+        researchPapers: event.researchPapers,
         summary: event.summary,
         toolName: event.toolName,
         type: 'tool-result'

@@ -1,3 +1,4 @@
+import { listItemSegments } from '@/shared/lib/listItemSegments';
 import { Bookmark, ListTree } from 'lucide-react';
 import { useEffect, useMemo, useRef, useState } from 'react';
 import type {
@@ -95,7 +96,7 @@ export function SegmentRail({
   const allSegments = useMemo(
     () =>
       pages
-        .flatMap((page) => page.segments)
+        .flatMap((page) => page.segments.flatMap(segment => [segment, ...listItemSegments(segment)]))
         .filter(
           (segment) =>
             normalizeBbox(segment.bbox) &&
@@ -241,6 +242,7 @@ export function SegmentRail({
             flashSegmentUid={flashSegmentUid}
             item={item}
             key={markerKey}
+            open={hoveredMarkerKey === markerKey}
             pointerY={pointerY}
             railHeight={railHeight}
             railWidth={railWidth}

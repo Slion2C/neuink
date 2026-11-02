@@ -46,6 +46,11 @@ function emit(event: DismissEvent) {
   return dismissed;
 }
 
+/** Clear existing previews and pending opens when another interaction boundary takes over. */
+export function dismissHoverInteractions() {
+  emit({ type:'interaction-boundary-change' });
+}
+
 /** One document subscription shared by all mounted hover triggers, including pending timers. */
 function listen(listener: Listener) {
   listeners.add(listener);
@@ -114,7 +119,7 @@ function detach() {
   handleDragEnd();
 }
 
-export function useHoverDismiss(onDismiss: () => boolean | void, enabled = true) {
+export function useHoverDismiss(onDismiss: (event: DismissEvent) => boolean | void, enabled = true) {
   const callbackRef = useRef(onDismiss);
   callbackRef.current = onDismiss;
   useEffect(() => {
@@ -124,7 +129,7 @@ export function useHoverDismiss(onDismiss: () => boolean | void, enabled = true)
       // Scrolling the document, clicking its trigger, or opening a menu dismisses it.
       if ((event.type === 'scroll' || event.type === 'pointerdown') &&
         event.target instanceof Element && event.target.closest('[data-hover-surface]')) return;
-      return callbackRef.current();
+      return callbackRef.current(event);
     });
   }, [enabled]);
 }

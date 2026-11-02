@@ -28,21 +28,26 @@ export function verifyHarnessResult({
   const entryMetaProposals = grounded.entryMetaProposals ?? [];
   const tagProposals = grounded.tagProposals ?? [];
   const toolEvents = grounded.toolEvents ?? [];
+  const hasExternalCitations = Boolean(grounded.externalCitationUrls?.length);
   const wantsTag = plan.deliverables.includes('tag_change_proposal');
   const wantsEntryMeta = plan.deliverables.includes('entry_meta_change_proposal');
   const modelDriven = plan.executionMode !== undefined;
+  // Missing deliverables after observed failures are limitations to report, not a
+  // reason to discard the parent's answer. Actual proposals/sources stay strict.
+  const reportingFailure = grounded.hadRecoverableFailures === true && Boolean(grounded.answer.trim());
+  const incomplete = (message: string) => (reportingFailure ? warnings : errors).push(message);
 
   if (plan.needsNoteProposal && proposals.length === 0) {
-    errors.push('A note proposal was required, but no proposal was generated.');
+    incomplete('A note proposal was required, but no proposal was generated.');
   }
   if (wantsEntryMeta && entryMetaProposals.length === 0) {
-    errors.push('An Entry metadata proposal was required, but no proposal was generated.');
+    incomplete('An Entry metadata proposal was required, but no proposal was generated.');
   }
   if (!modelDriven && !wantsEntryMeta && entryMetaProposals.length > 0) {
     errors.push('A non-Entry-metadata task produced an Entry metadata proposal.');
   }
   if (wantsTag && tagProposals.length === 0) {
-    errors.push('A Tag proposal was required, but no proposal was generated.');
+    incomplete('A Tag proposal was required, but no proposal was generated.');
   }
   if (!modelDriven && !wantsTag && tagProposals.length > 0) {
     errors.push('A non-Tag task produced a Tag proposal.');
@@ -67,18 +72,20 @@ export function verifyHarnessResult({
     warnings.push('The plan requested segment search, but no search evidence was produced.');
   }
   if (plan.deliverables.includes('chat_answer') &&
-    plan.citationPolicy === 'required' && grounded.sources.length === 0) {
-    errors.push('A paper-grounded answer was produced without a valid source citation.');
+    plan.citationPolicy === 'required' && grounded.sources.length === 0 && !hasExternalCitations) {
+    incomplete('A paper-grounded answer was produced without a valid source citation.');
   }
   if (
     invocationPlan.sourcePolicy === 'sciverse_only' &&
-    (grounded.sources.length === 0 || grounded.sources.some((source) => !isSciverseConversationSource(source)))
+    (hasExternalCitations || grounded.sources.length === 0 || grounded.sources.some((source) => !isSciverseConversationSource(source)))
   ) {
-    errors.push('The task required Sciverse-only evidence, but the final sources did not satisfy that policy.');
+    if (hasExternalCitations || grounded.sources.some(source => !isSciverseConversationSource(source))) {
+      errors.push('The task required Sciverse-only evidence, but the final sources did not satisfy that policy.');
+    } else incomplete('The task required Sciverse evidence, but no source could be cited.');
   }
   if (
     invocationPlan.sourcePolicy === 'workspace_only' &&
-    grounded.sources.some((source) => !isLocalConversationSource(source))
+    (hasExternalCitations || grounded.sources.some((source) => !isLocalConversationSource(source)))
   ) {
     errors.push('The task required workspace-only evidence, but an external source was included.');
   }
@@ -90,7 +97,8 @@ export function verifyHarnessResult({
       (source) => isLocalConversationSource(source) && source.entry_id === plan.target.entryId
     )
   ) {
-    errors.push('The current-paper answer has no citation from the frozen active Entry.');
+    if (grounded.sources.length === 0) incomplete('The current-paper answer has no citation from the frozen active Entry.');
+    else errors.push('The current-paper answer has no citation from the frozen active Entry.');
   }
   if (plan.needsNoteProposal && plan.citationPolicy === 'required' &&
     proposals.some((proposal) => proposal.sources.length === 0)) {

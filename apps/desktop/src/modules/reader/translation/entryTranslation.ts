@@ -1,4 +1,5 @@
 import { generateText } from 'ai';
+import { translateSelectionService } from '@/shared/ipc/selectionTranslationApi';
 
 import { getLlmSettings, readEntryAssistantContext } from '@/shared/ipc/assistantApi';
 import {
@@ -12,8 +13,10 @@ import {
   type TranslationTerm
 } from '@/shared/ipc/workspaceApi';
 import type { SourceSegment } from '@/shared/types/domain';
+import { runLocalBackgroundJob } from '@/shared/lib/localBackgroundJobs';
 
 import { createNeuinkModel, generationSettings } from '../../assistant/sdk/provider';
+import { expandEnglishLigatures, singleEnglishWord, translateLocalEnglishWord } from './localEnglishLexicon';
 
 const MAX_PAPER_CONTEXT_BUDGET = 28_000;
 const MAX_BATCH_CHAR_BUDGET = 7_500;
@@ -30,45 +33,66 @@ export type TranslationRunStrategy = 'restart' | 'resume';
 
 export async function translateTextSelection({
   context,
+  entryId,
   entryTitle,
+  root,
   text
 }: {
   context?: string | null;
+  entryId: string;
   entryTitle: string;
+  root: string | null;
   text: string;
 }) {
-  const sourceText = text.trim();
-  if (!sourceText) {
+  const expandedText = expandEnglishLigatures(text.trim());
+  const word = singleEnglishWord(expandedText);
+  const sourceText = word ?? expandedText;
+  if (!/[\p{L}\p{N}]/u.test(sourceText)) {
     throw new Error('没有可翻译的文字。');
   }
-  const settings = await getLlmSettings();
-  const profile = settings.translation_profile;
-  if (!profile) {
-    throw new Error('请先在模型设置里配置翻译模型。');
-  }
+  const localTranslation = word ? await translateLocalEnglishWord(word) : null;
+  if (localTranslation) return localTranslation;
+  return runLocalBackgroundJob({
+    idPrefix: 'selection-translation',
+    kind: 'paragraph_translation',
+    scope: root ? { kind: 'entry', root, entry_id: entryId } : null,
+    message: `正在翻译选中文字：${entryTitle}`,
+    successMessage: `选区翻译完成：${entryTitle}`,
+    failureMessage: '选区翻译未完成，请返回原选区重试。'
+  }, async () => {
+    const serviceTranslation = await translateSelectionService(sourceText);
+    if (serviceTranslation !== null) return serviceTranslation;
+    const settings = await getLlmSettings();
+    const profile = settings.translation_profile;
+    if (!profile) {
+      throw new Error('请先在模型设置里配置翻译模型。');
+    }
 
-  const result = await generateText({
-    ...generationSettings(profile),
-    model: createNeuinkModel(profile),
-    system: [
-      'You are an academic paper translator.',
-      'Translate the selected text into Simplified Chinese.',
-      'Preserve formulas, citations, numbers, abbreviations, code, and technical symbols.',
-      'Return the translation only. Do not return JSON, explanations, labels, or markdown fences.'
-    ].join('\n'),
-    prompt: [
-      `Paper title: ${entryTitle}`,
-      context?.trim()
-        ? `Paragraph context:\n${trimToBudget(context.trim(), translationBudgets(profile.max_context_length).context)}`
-        : null,
-      `Selected text:\n${sourceText}`
-    ].filter(Boolean).join('\n\n')
+    const result = await generateText({
+      ...generationSettings(profile),
+      model: createNeuinkModel(profile),
+      system: word
+        ? 'Translate the single English word into concise Simplified Chinese dictionary meanings. Return the meanings only.'
+        : [
+          'You are an academic paper translator.',
+          'Translate the selected text into Simplified Chinese.',
+          'Preserve formulas, citations, numbers, abbreviations, code, and technical symbols.',
+          'Return the translation only. Do not return JSON, explanations, labels, or markdown fences.'
+        ].join('\n'),
+      prompt: word ? word : [
+        `Paper title: ${entryTitle}`,
+        context?.trim()
+          ? `Paragraph context:\n${trimToBudget(context.trim(), translationBudgets(profile.max_context_length).context)}`
+          : null,
+        `Selected text:\n${sourceText}`
+      ].filter(Boolean).join('\n\n')
+    });
+    const translatedText = result.text.trim();
+    if (!translatedText) {
+      throw new Error('翻译模型没有返回可用译文。');
+    }
+    return translatedText;
   });
-  const translatedText = result.text.trim();
-  if (!translatedText) {
-    throw new Error('翻译模型没有返回可用译文。');
-  }
-  return translatedText;
 }
 
 export async function translateEntrySegments({
@@ -327,9 +351,9 @@ function shouldTranslateSegment(segment: SourceSegment) {
   if (text.length < 2) {
     return false;
   }
+  // Display preservation does not prohibit generating a saved translation.
+  if (['code', 'table', 'figure', 'math'].includes(segment.segment_type)) return true;
   if (
-    segment.segment_type === 'figure' ||
-    segment.segment_type === 'math' ||
     segment.segment_type === 'page_header' ||
     segment.segment_type === 'page_footer' ||
     segment.segment_type === 'page_number' ||

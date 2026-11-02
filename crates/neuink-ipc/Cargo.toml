@@ -20,20 +20,34 @@ futures-util.workspace = true
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+quick-xml = { version = "0.39.4", features = ["serialize"] }
+scraper = { version = "0.24", default-features = false }
+subtp = "0.2.0"
+encoding_rs = "0.8"
+tempfile = "3"
 tauri.workspace = true
 thiserror.workspace = true
-tokio = { workspace = true, features = ["sync", "process", "io-util", "time"] }
+tokio = { workspace = true, features = ["sync", "process", "io-util", "time", "net"] }
 tokio-stream.workspace = true
 zip.workspace = true
 
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+
 [target.'cfg(target_os = "windows")'.dependencies]
 keyring = { workspace = true, features = ["windows-native"] }
+webview2-com = "0.38.2"
+windows-core = "0.61.2"
+windows = { version = "0.61.3", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_UI_WindowsAndMessaging", "Win32_UI_Shell", "Win32_System_Com", "Win32_System_JobObjects", "Win32_System_Threading", "Win32_Security"] }
 
 [target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies]
 keyring = { workspace = true, features = ["apple-native"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 keyring = { workspace = true, features = ["crypto-rust", "linux-native-sync-persistent"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [features]
 default = ["local-embedding"]

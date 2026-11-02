@@ -107,6 +107,7 @@ export const SIDEBAR_MIN_WIDTH = 220;
 export const SIDEBAR_MAX_WIDTH = 820;
 export const DEFAULT_SIDEBAR_WIDTH = 280;
 export const WORKSPACE_SPLIT_WIDTH_STORAGE_KEY = 'neuink.workspaceSplitLeftWidth';
+export const WORKSPACE_SPLIT_RATIO_STORAGE_KEY = 'neuink.workspaceSplitRatio';
 export const ENTRY_CONTENT_TAB_PREFIX = 'entry-content:';
 
 export const EMPTY_SIDE_PANE: SidePaneState = {
@@ -164,7 +165,7 @@ export function readStoredSidePanel(): SidePanel {
 export function readStoredLibraryView(): LibraryView {
   if (typeof window === 'undefined') return 'all';
   const value = window.localStorage.getItem(LIBRARY_VIEW_STORAGE_KEY);
-  return value === 'recent' || value === 'parsed' || value === 'parsing' || value === 'failed' || value === 'no_pdf' || value === 'trash' ? value : 'all';
+  return value === 'recent' || value === 'unparsed' || value === 'parsed' || value === 'parsing' || value === 'failed' || value === 'no_pdf' || value === 'trash' ? value : 'all';
 }
 
 export function readStoredRecentReading() {
@@ -185,6 +186,13 @@ export function readStoredWorkspaceSplitLeftWidth() {
   return Number.isFinite(saved) && saved >= WORKSPACE_SPLIT_NOTE_MIN_WIDTH
     ? Math.round(saved)
     : null;
+}
+
+export function readStoredWorkspaceSplitRatio() {
+  if (typeof window === 'undefined') return null;
+  const raw = window.localStorage.getItem(WORKSPACE_SPLIT_RATIO_STORAGE_KEY);
+  const ratio = raw === null ? NaN : Number(raw);
+  return Number.isFinite(ratio) && ratio > 0 && ratio < 1 ? ratio : null;
 }
 
 export function getWorkspaceSplitContainerWidth() {
@@ -222,9 +230,9 @@ export function toLibraryEntry(entry: EntryMeta, tagPathById: Map<string, string
             ? 'Uploading'
             : parseStatus === 'parsing'
               ? 'Parsing'
-              : entry.pdf
+              : parseStatus === 'queued'
                 ? 'Queued'
-                : 'No PDF';
+                : entry.pdf ? 'Not started' : 'No PDF';
   const tagIds = entry.tags ?? [];
 
   return {
@@ -240,7 +248,7 @@ export function toLibraryEntry(entry: EntryMeta, tagPathById: Map<string, string
     parseMessage: entry.pdf?.parse.message ?? null,
     parseEndpoint: entry.pdf?.parse.endpoint ?? null,
     status,
-    progress: status === 'Parsed' ? 100 : status === 'Queued' ? 32 : 0
+    progress: status === 'Parsed' ? 100 : 0
   };
 }
 

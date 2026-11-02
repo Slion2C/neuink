@@ -13,10 +13,25 @@ export function SettingsPage({ tab, title, description, children }: { tab: Setti
   </TabsContent>;
 }
 
-export function SettingsGroup({ id, title, description, children }: { id?: string; title: string; description?: string; children: ReactNode }) {
+export function SettingsGroup({ id, title, description, children, action }: { id?: string; title: string; description?: string; children: ReactNode; action?: ReactNode }) {
   return <section data-setting-id={id} tabIndex={id ? -1 : undefined} className="settings-group">
-    <h3 className="text-sm font-semibold">{title}</h3>{description && <p className="mt-1 text-xs leading-5 text-muted-foreground">{description}</p>}
+    <div className="flex flex-wrap items-center justify-between gap-2"><h3 className="text-sm font-semibold">{title}</h3>{action}</div>
+    {description && <p className="mt-1 text-xs leading-5 text-muted-foreground">{description}</p>}
     <div className="mt-2">{children}</div>
+  </section>;
+}
+
+/** Settings are always expanded; the surrounding settings viewport owns scrolling. */
+export function SettingsServiceSection({ id, title, description, status, children }: {
+  id?: string; title: string; description: string; status: string; children: ReactNode;
+}) {
+  return <section data-setting-id={id} tabIndex={id ? -1 : undefined} className="settings-service">
+    <div className="flex flex-wrap items-center gap-3 py-3">
+      <span className="min-w-0 flex-1"><span className="block text-[13px] font-medium">{title}</span>
+        <span className="mt-1 block text-xs leading-5 text-muted-foreground">{description}</span></span>
+      <span className="shrink-0 text-xs text-muted-foreground">{status}</span>
+    </div>
+    <div className="min-w-0 pb-3">{children}</div>
   </section>;
 }
 

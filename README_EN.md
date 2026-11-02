@@ -5,6 +5,47 @@
 <h1 align="center">Neuink</h1>
 
 <p align="center">
+  <strong><a href="https://sugrsertraline.github.io/neuink/">Explore Neuink — Product Website →</a></strong><br>
+  Features, real app screenshots, core concepts, and step-by-step tutorials.<br>
+  <a href="https://sugrsertraline.github.io/neuink/start.html">Start reading</a> · <a href="https://sugrsertraline.github.io/neuink/screenshots.html">Screenshot guide</a> · <a href="https://cdn.sugrsertraline.top/Neuink-windows-x64-portable.zip">Download for Windows</a>
+</p>
+
+## What's new in the 0.1.3 preview
+
+- **Reliable shutdown:** finish active assistant work before closing and stop child processes launched by the app. Codex connections can reconnect after a disconnect.
+- **Web citations:** retain verified bracketed web citations in assistant answers.
+
+This update contains verified fixes from the stable branch. The experimental research memory feature is excluded. See the [release notes](CHANGELOG.md).
+
+## What's new in the 0.1.2 preview
+
+- **Carry your data with the app:** on Windows, papers, notes, chats, settings and reading state live in `data` beside the executable. Close Neuink before copying the complete folder to a USB drive.
+- **Import legacy data automatically:** startup checks `neuink_data` beside the app and at the drive root, retains current files on conflicts, and moves the old folder to the Recycle Bin only after verification succeeds.
+- **Read returned Agent reasoning:** preview thinking text or summaries supplied by Claude Code, Codex or OpenCode, expand the returned content, and revisit it in saved chats.
+
+Experimental global memory and LAN sharing are excluded. See [release notes and validation limits](CHANGELOG.md).
+
+## Reading improvements from 0.1.1
+
+- **Reading and citations:** improved PDF text selection and hover behavior. Hold Ctrl and drag a block into the composer; a translucent overlay marks the drop target. Preview citations on hover and click to return to the source, in drafts and sent messages. Draft references can be removed and restored.
+- **Individual list items:** references, numbered lists, and bullet lists now retain item-level context, notes, and annotations, with an explicit whole-list option.
+- **Resume reading:** restore workspace tabs, split views, and supported reading positions. New chats remember the last selected model or local Agent.
+- **Local Agents:** connect an installed Claude Code client, with Codex and OpenCode adapters also available. Approve operations once or remember permissions, and revoke them in settings. See the [release notes](CHANGELOG.md) for validation limits.
+- **Materials and notes:** retrieve a missing PDF from entry details, improved SciVerse PDF/image saving, stable image-resize controls, and formula corrections. Selection translation can use Azure, DeepL, or Qwen-MT independently.
+
+Read the [release changes and validation scope](CHANGELOG.md) or the [assistant guide](https://sugrsertraline.github.io/neuink/assistant.html) (Chinese).
+
+## Downloads and updates
+
+**[Download Windows x64 portable ZIP (CDN)](https://cdn.sugrsertraline.top/Neuink-windows-x64-portable.zip)**
+
+Fully extract the ZIP, keep the bundled resource folders, and run `Neuink.exe`. Do not run it from inside the archive.
+
+Windows requires Windows 10 1903+ / 11 x64 and WebView2. To update, close the app and back up the entire `data` folder. Keep your original `data` beside the new program files; never overwrite it with the empty folder from a public download.
+
+macOS preview builds for Apple Silicon and Intel are available from successful [automated builds](https://github.com/SugrSertraline/neuink/actions/workflows/windows-portable.yml). They are not notarized or validated on a physical Mac; Gatekeeper may block launch. Embedded web pages and the video-caption runtime have not been ported. See [downloads and platform details](docs/deployment/packaging-and-distribution.md).
+
+<p align="center">
   <a href="README.md">简体中文</a> · <strong>English</strong>
 </p>
 
@@ -14,7 +55,7 @@
 
 <p align="center">
   <strong>Make every reading insight traceable.</strong><br>
-  A local-first workspace for reading, thinking, and building knowledge from PDFs.
+  A local-first workspace for literature, evidence-linked notes, and AI-assisted research.
 </p>
 
 <p align="center">
@@ -25,170 +66,129 @@
   <a href="https://linux.do"><img src="https://img.shields.io/badge/LINUX-DO-FFB003.svg?logo=data:image/svg%2bxml;base64,DQo8c3ZnIHhtbG5zPSJodHRwOi8vd3d3LnczLm9yZy8yMDAwL3N2ZyIgd2lkdGg9IjEwMCIgaGVpZ2h0PSIxMDAiPjxwYXRoIGQ9Ik00Ni44Mi0uMDU1aDYuMjVxMjMuOTY5IDIuMDYyIDM4IDIxLjQyNmM1LjI1OCA3LjY3NiA4LjIxNSAxNi4xNTYgOC44NzUgMjUuNDV2Ni4yNXEtMi4wNjQgMjMuOTY4LTIxLjQzIDM4LTExLjUxMiA3Ljg4NS0yNS40NDUgOC44NzRoLTYuMjVxLTIzLjk3LTIuMDY0LTM4LjAwNC0yMS40M1EuOTcxIDY3LjA1Ni0uMDU0IDUzLjE4di02LjQ3M0MxLjM2MiAzMC43ODEgOC41MDMgMTguMTQ4IDIxLjM3IDguODE3IDI5LjA0NyAzLjU2MiAzNy41MjcuNjA0IDQ2LjgyMS0uMDU2IiBzdHlsZT0ic3Ryb2tlOm5vbmU7ZmlsbC1ydWxlOmV2ZW5vZGQ7ZmlsbDojZWNlY2VjO2ZpbGwtb3BhY2l0eToxIi8+PHBhdGggZD0iTTQ3LjI2NiAyLjk1N3EyMi41My0uNjUgMzcuNzc3IDE1LjczOGE0OS43IDQ5LjcgMCAwIDEgNi44NjcgMTAuMTU3cS00MS45NjQuMjIyLTgzLjkzIDAgOS43NS0xOC42MTYgMzAuMDI0LTI0LjM4N2E2MSA2MSAwIDAgMSA5LjI2Mi0xLjUwOCIgc3R5bGU9InN0cm9rZTpub25lO2ZpbGwtcnVsZTpldmVub2RkO2ZpbGw6IzE5MTkxOTtmaWxsLW9wYWNpdHk6MSIvPjxwYXRoIGQ9Ik03Ljk4IDcwLjkyNmMyNy45NzctLjAzNSA1NS45NTQgMCA4My45My4xMTNRODMuNDI2IDg3LjQ3MyA2Ni4xMyA5NC4wODZxLTE4LjgxIDYuNTQ0LTM2LjgzMi0xLjg5OC0xNC4yMDMtNy4wOS0yMS4zMTctMjEuMjYyIiBzdHlsZT0ic3Ryb2tlOm5vbmU7ZmlsbC1ydWxlOmV2ZW5vZGQ7ZmlsbDojZjlhZjAwO2ZpbGwtb3BhY2l0eToxIi8+PC9zdmc+" alt="LINUX DO"></a>
 </p>
 
-<p align="center">
-  <img src="docs/assets/screenshots/reading-workspace.png" alt="Neuink reading workspace with the original PDF, source segments, and bilingual preview" width="100%">
-</p>
+> **Neuink** brings library management, PDF and web reading, cross-paper comparison, evidence-linked notes, search, and AI research into one local workspace. Return from an insight to its source, or export your work as independent files.
 
-> **Neuink** is a local-first knowledge workspace for papers, reports, standards, and book chapters. It brings PDF reading, structured parsing, notes, search, and AI collaboration into one Workspace—while keeping every conclusion connected to its original evidence.
+**Organize → Read and compare → Connect notes to evidence → Search and research → Export and share**
 
-## From PDF to verifiable understanding
+[Core features](#core-features) · [Getting started](#getting-started) · [Local and online capabilities](#local-and-online-capabilities) · [Development and builds](#development-and-builds) · [Documentation](#documentation)
 
-```text
-Import material  →  Parse structure  →  Read and annotate  →  Connect notes to sources  →  Search, ask, and retain
-```
+## Complete product guide
 
-Neuink treats literature work as more than finishing a file. It turns pages, paragraphs, tables, and formulas into locatable context; connects notes with evidence; and uses search and AI collaboration to turn scattered reading into knowledge you can revisit and reuse.
+The [documentation website](website/README.md) contains 22 detailed guides in Chinese, covering workflows, controls, data boundaries, and troubleshooting, with section search and mobile navigation. It is published on GitHub Pages at [Neuink Product & User Guide](https://sugrsertraline.github.io/neuink/). The [guide sources](website/content) can also be read directly in this repository.
 
-| Original and structured reading | Evidence-linked notes | Local search and AI collaboration |
-| :--- | :--- | :--- |
-| Switch between the original PDF layout and a Reflow view; locate headings, paragraphs, lists, formulas, tables, and visual blocks. | Write in Markdown and insert Source Links that can expand, jump to evidence, and export as readable footnotes. | Search entries, tags, fields, notes, pages, and segments; use explicit context to receive source-linked answers. |
+## Core features
 
-## A visible workflow
+### 1. A library organized around research topics
 
-<table>
-  <tr>
-    <td width="50%" valign="top">
-      <img src="docs/assets/screenshots/assistant-and-notes.png" alt="Neuink AI assistant and learning-note editor" />
-      <br /><br />
-      <strong>Write inside the context</strong><br />
-      The AI assistant, source links, and Markdown editor share one workspace. The assistant reads only explicitly selected context, and note or metadata changes are first presented as proposals for you to apply.
-    </td>
-    <td width="50%" valign="top">
-      <img src="docs/assets/screenshots/pdf-notes-split-view.png" alt="Neuink split view for PDFs and notes" />
-      <br /><br />
-      <strong>Keep the source beside your thinking</strong><br />
-      Keep the original PDF layout and segment navigation on the left while building notes on the right. Key claims can retain their page and segment path back to the evidence.
-    </td>
-  </tr>
-</table>
+- Create entries, import or batch-drop PDFs, and manage titles, descriptions, hierarchical tags, and custom fields. Browse in a table or bookshelf.
+- Import MinerU client result ZIPs or connect a self-hosted compatible parser. Track queued, running, and failed parsing jobs and retry failures.
+- Browse papers by tag and descendant tags, with reading progress, page positions, and notes. Use the corresponding trash views to recover deleted entries, notes, and tags.
+- Explore tag hierarchies, paper membership, note ownership, and source references in the relationship graph. Search, filter, and open related content. These are stored relationships, not an automatically discovered academic citation network.
 
-## Core capabilities
+### 2. A reading workspace for originals, reflow, and comparison
 
-### Read deeply, not just faster
+- **Original PDFs:** retain page layout with outlines, zoom, segment navigation, hover previews, annotations, and segment notes. PDFs can be read before parsing.
+- **Reflow:** read parsed paragraphs, lists, formulas, tables, and figures, switching between original images and parsed content where available.
+- **Translation:** use a configured model for selections, segments, or full papers. View original and translated text; pause, resume, cancel, or retry full-paper translation tasks.
+- **Parallel reading by tag:** open a paper and a comparison paper from the same topic. Read each pane independently and work with document notes or tag-level synthesis notes.
+- **Tabs and split views:** arrange PDFs, reflow, notes, complete assistant replies, and web pages using sortable, pinnable tabs and left/right panes. A task panel collects parsing, translation, paper-import, and assistant activity.
 
-- Import PDFs, monitor parsing, retry failures, and retain both the original PDF and normalized Source Segments.
-- Read original layouts with PDF.js, hover previews, segment navigation, contextual actions, and source panels.
-- Use Reflow for parsed prose, lists, formulas, tables, and visual content; run full-text translation, pause, retry, or export when needed.
+### 3. Evidence-linked notes
 
-### Turn notes into an evidence network
+- Write document notes and tag-level synthesis notes in a Markdown editor with an outline, tables, images, code, math, and Mermaid diagrams.
+- Capture segment notes and annotations; Source Links retain the entry, page, segment, and text snapshot.
+- Preview sources, jump back to the original, and inspect backlinks. Document-note Markdown exports retain readable source footnotes.
+- Unsaved-content protection covers closing, moving between panes, and switching workspaces; version checks protect against overwriting changed content.
 
-- Use the TipTap Markdown editor for headings, lists, quotations, code, mathematics, images, callouts, and tables.
-- Structure notes with annotations, tags, and custom fields; a Source Link retains the entry, page, segment, and text snapshot.
-- Preview the source from a note, jump back to the PDF, inspect backlinks, and retain readable footnotes in exported Markdown.
+### 4. Local search and AI-assisted research
 
-### Search and collaborate across a local library
+- **Local search:** keyword search covers entries, tags, fields, document notes, segment notes, PDF pages, and parsed segments. Optional local embeddings enable semantic and hybrid search, with explicit fallback when unavailable.
+- **Context-aware conversations:** associate the current reading object, use `@` for PDFs and document notes, select entries or tags, Ctrl-drag individual segments, or disconnect content. Conversations retain sources, tool activity, and proposal states.
+- **Reviewable changes:** document-note, tag, and metadata changes are proposed for review before you apply them. General Agent writing to tag-level synthesis notes is not yet connected.
+- **Online research:** built-in paper search, web search, and content reading use configured sources including arXiv, Crossref, OpenAlex, and optional Tavily or Sciverse. Adding candidates requires confirmation; results distinguish downloaded PDFs from metadata-only entries.
+- **Model choice:** configure OpenAI-compatible, Anthropic, or Google connections and select separate models for the assistant and translation.
 
-- Keyword search spans entries, tags, fields, Markdown Notes, Segment Notes, PDF pages, and PDF Segments.
-- With the optional local embedding model, Semantic and Hybrid modes are available. When it is unavailable, Neuink states this clearly and falls back instead of presenting keyword results as semantic ones.
-- AI conversations use explicit `@` context, workspace search, and source links. Tool traces, conversations, and proposal state are saved to the Workspace.
+### 5. Web reading within your research workspace
 
-## Local-first, without giving up extensibility
+On Windows, native web tabs provide an address bar, back/forward navigation, independent zoom, and split views, with up to eight web tabs. Associate a page with the assistant to read its body or selection on demand and propose a document note.
 
-| Local by default | Bring your own services | You keep control |
-| :--- | :--- | :--- |
-| A Workspace is an ordinary local folder and the source of truth for PDFs, notes, tags, conversations, and derived files. Reading, editing, and keyword search work without a network connection. | Parsing can connect to MinerU Cloud or a compatible custom endpoint; you choose and configure your AI model service. | API keys are not written into Workspace data or exports; caches are rebuildable; AI changes are never silently written and require you to apply a proposal. |
+| Content | Current reading scope |
+| :--- | :--- |
+| Web pages | Extract the loaded article, with bounded visible-text fallback for non-article pages. |
+| Public PDFs | Extract text from the first eight pages by default, or a requested range of 1–20 pages per call. Report coverage; no automatic OCR or library import. |
+| Individual YouTube / Bilibili videos | Read public descriptions and available Chinese or English captions. Missing captions and restrictions are explicit; this does not analyze video frames or audio. |
 
-### MinerU, models, and service boundaries
+Opening a web tab does not automatically send its body to the model. Public PDF and video reads may fetch the resource again without browser cookies. Platform limits are listed below.
 
-- **MinerU**: Neuink integrates MinerU Cloud and compatible parser endpoints to turn PDFs into structured results for Reflow, segment navigation, and source links. MinerU is an optional external parsing capability; it is not bundled with this repository or the primary application. When using a cloud service, review its terms and data-handling policy yourself.
-- **Local semantic model**: Semantic and Hybrid search use optional local resources compatible with `intfloat/multilingual-e5-small`. The files are large, ignored by Git, and never downloaded silently at runtime. Neuink remains usable without the model; semantic search is simply unavailable.
-- **LLMs**: Neuink does not ship a large language model. Configure your own model service in Settings; basic reading, notes, and keyword search do not depend on an LLM.
+### 6. Export and share reading results
 
-## Quick start
+| Content | Supported output |
+| :--- | :--- |
+| Parsed full text, Chinese translation, bilingual manuscript | DOCX, TXT, or a Markdown ZIP with images; includes content checks and previews of missing items. |
+| A paper's document notes, segment notes, annotations, and translated segments | Select items for a combined DOCX/TXT or a ZIP of individual DOCX/TXT files. |
+| Document-note Markdown | Save a local MD file with readable source footnotes. |
 
-### Requirements
+Exports use saved data, independent of collapsed sections or virtual scrolling. Missing translations, stale results, and missing images are listed; you can explicitly export a draft with these caveats. Word output preserves content structure rather than reproducing the PDF's layout. Chinese PDFs, annotated PDFs, and PPTX are not current export formats.
 
-- Node.js and npm
-- Rust stable and the [Tauri 2 platform prerequisites](https://v2.tauri.app/start/prerequisites/)
-- A MinerU Cloud token or compatible parser endpoint only when PDF parsing is needed
-- An LLM profile only when AI collaboration is needed
+## Interface examples
+
+Read the [illustrated user guide](https://sugrsertraline.github.io/neuink/screenshots.html) (Chinese) for core concepts, feature entry points, and step-by-step workflows. The workspace below places the original PDF beside evidence-linked notes.
+
+![Neuink: original PDF alongside evidence-linked demo notes](website/public/screenshots/pdf-note-workspace.png)
+
+
+## Getting started
+
+### If you already have a Windows portable build
+
+Extract the complete archive and open `Neuink.exe`, keeping its resource directories beside it. Node.js and Rust are not needed; Microsoft Edge WebView2 Runtime is required. Portable builds use the application's existing workspace and settings locations, so user data is not necessarily stored beside the executable.
+
+The project version is **0.1.3**. A Windows portable build workflow exists; signing, in-app updates, and native distribution validation still have outstanding work. See [packaging and distribution](docs/deployment/packaging-and-distribution.md) for automated builds, downloads, and platform validation status.
+
+### Your first paper
+
+1. **Create or open a workspace** in the data settings. Onboarding introduces the main controls; offline examples depend on the build including demo assets.
+2. **Import a PDF** to read immediately. For structured content, follow the in-app MinerU client guide: parse externally, export the complete results as a ZIP, then import them into Neuink.
+3. **Organize and compare:** assign topic tags, open PDF or Reflow, and choose another paper from the same-tag list for comparison.
+4. **Capture evidence:** create a document or tag-level note, insert Source Links, and save.
+5. **Enable AI as needed:** configure connections and assign assistant/translation models, select your context, ask questions, and review proposed changes.
+6. **Export:** use the PDF/Reflow export action for manuscripts, or the document note / entry overview for selected reading results.
+
+For parsing, reflow, or translation, follow the [PDF import and parsing tutorial](https://sugrsertraline.github.io/neuink/import.html) (Chinese). Reading an ordinary PDF does not require a parser service.
+
+## Local and online capabilities
+
+| Capability | Requirements and data scope |
+| :--- | :--- |
+| Library management, PDF / parsed-content reading, notes, keyword search, saved-result exports | Local; no LLM or online parser required. |
+| Semantic / hybrid search | Optional local embedding resources; no silent runtime model downloads. |
+| Structured PDF parsing | Import an existing MinerU ZIP or send the PDF to your configured compatible parser. |
+| AI conversations and translation | Your configured model service receives the relevant context. |
+| Online paper / web research | Network access; optional services also depend on credentials, permissions, and quotas. |
+| Embedded web pages / video captions | Native embedding currently runs on Windows; the bundled video runtime currently targets Windows x64. |
+
+A Workspace is a normal local folder containing PDFs, notes, annotations, tags, translations, and conversations. Search caches can be rebuilt. API keys are not part of the Workspace or sharing bundles. Workspace migration copies and verifies data while retaining the original directory.
+
+**Scope:** the local graph displays existing relationships. Automated research-direction maps, evidence comparison tables, dragging tabs into separate native windows, and team cloud collaboration are not among the implemented features described here. The [development plan](docs/development/dev-plan.md) tracks completion and remaining work.
+
+## Development and builds
+
+Install Node.js, npm, Rust stable, and the [Tauri 2 prerequisites](https://v2.tauri.app/start/prerequisites/), then run:
 
 ```powershell
 npm install
 npm run desktop:dev
 ```
 
-On first launch, create or open a local Workspace. Basic reading, notes, and keyword search work even without `.env`, an embedding model, or an LLM.
+Basic reading and notes do not require a model service. See [packaging and distribution](docs/deployment/packaging-and-distribution.md) for model resources, browser-reading components, and release builds, and [engineering guidelines](docs/development/engineering-guidelines.md) for development checks.
 
-<details>
-<summary><strong>Optional: configure MinerU Cloud</strong></summary>
+## Documentation
 
-Copy the template and fill in only what you need. Never commit a real `.env` file or API key.
-
-```powershell
-Copy-Item .env.example .env
-```
-
-</details>
-
-<details>
-<summary><strong>Optional: enable local semantic search</strong></summary>
-
-Place compatible `intfloat/multilingual-e5-small` resources in:
-
-```text
-apps/desktop/src-tauri/resources/embedding-models/default/
-```
-
-The model directory is protected by Git ignore rules. Before distributing an application with the model, verify its licence, file integrity, and actual load behaviour.
-
-</details>
-
-## Build and verify
-
-```powershell
-# Type-check and build the frontend
-npm run desktop:build
-
-# Rust checks, Rust tests, and frontend tests
-npm run check
-npm run test
-npm --workspace apps/desktop run test:frontend
-
-# Build the native Tauri bundle
-npm --workspace apps/desktop run tauri -- build
-```
-
-Build a portable Windows ZIP:
-
-```powershell
-npm run desktop:release:portable
-```
-
-The command outputs `release/Neuink-portable-<timestamp>.zip` and includes only `.env.example`, never your local `.env` credentials. The current portable flow requires local embedding resources.
-
-Extract the archive and double-click `Neuink.exe`, or create a desktop shortcut to it. The release executable embeds the frontend and needs neither a command prompt nor a frontend development server. Keep the adjacent `embedding-models` directory with the executable.
-
-`desktop:dev` and `target/debug/neuink-desktop.exe` run in development mode and need the local page server; the Windows debug executable also keeps its console. `desktop:build` builds only the frontend and does not update a standalone desktop executable. To use the latest code, rebuild the native bundle or portable release and point your shortcut to the new output.
-
-## Project layout
-
-```text
-apps/desktop/   Tauri desktop shell, React UI, and packaging scripts
-crates/         Rust domain, Workspace, parser, search, job, config, and IPC crates
-docs/           Product, architecture, engineering, regression, and release docs
-```
-
-Start with the [documentation index](docs/README.md), then see the [product requirements](docs/product/01-prd.md), [system architecture](docs/architecture/system-architecture.md), and [packaging and distribution notes](docs/deployment/packaging-and-distribution.md).
-
-## Open-source components and licences
-
-Neuink itself is licensed under [Apache License 2.0](LICENSE). The project uses the following important direct dependencies; their own licences and notices remain applicable when you distribute a build.
-
-| Component | Role in Neuink | Licence |
-| :--- | :--- | :--- |
-| [Tauri](https://tauri.app/) and Tauri plugins | Desktop runtime, native dialogs, HTTP | Apache-2.0 OR MIT |
-| [React](https://react.dev/), [Vite](https://vite.dev/), [Tailwind CSS](https://tailwindcss.com/) | User interface and build tooling | MIT |
-| [PDF.js](https://mozilla.github.io/pdf.js/) | Original PDF rendering | Apache-2.0 |
-| [TipTap](https://tiptap.dev/), [KaTeX](https://katex.org/), [Mermaid](https://mermaid.js.org/) | Markdown editing, mathematics, and diagrams | MIT |
-| [assistant-ui](https://www.assistant-ui.com/) | AI chat interface | MIT |
-| [Vercel AI SDK](https://ai-sdk.dev/) and `@ai-sdk/openai-compatible` | Model-service integration and streaming responses | Apache-2.0 |
-| [FastEmbed](https://crates.io/crates/fastembed), [Tokio](https://tokio.rs/), [Reqwest](https://crates.io/crates/reqwest), [Serde](https://serde.rs/), [Rayon](https://github.com/rayon-rs/rayon) | Local embeddings, async runtime, networking, serialization, and parallel search | Apache-2.0, MIT, or MIT OR Apache-2.0, as declared by each crate |
-| [`intfloat/multilingual-e5-small`](https://huggingface.co/intfloat/multilingual-e5-small) | Optional local embedding model | MIT |
-| [MinerU](https://github.com/opendatalab/MinerU) | Optional PDF parsing integration; not distributed by this repository | MinerU Open Source License (Apache-2.0 based, with additional terms) |
-
-This is a readable summary of primary components, not a replacement for complete third-party notices. Exact resolved versions are locked in [`package-lock.json`](package-lock.json) and [`Cargo.lock`](Cargo.lock). Before publishing an installer, generate full notices for every resolved npm and Cargo dependency, and review the terms of every model file or external service you distribute or operate.
+- [Documentation index](docs/README.md)
+- [Product requirements](docs/product/01-prd.md) and [system architecture](docs/architecture/system-architecture.md)
+- [Development plan](docs/development/dev-plan.md): implementation status and pending validation
+- [Engineering guidelines](docs/development/engineering-guidelines.md), [UI design system](docs/development/ui-design-system.md), and [system test cases](docs/development/system-test-cases.md)
 
 ## Licence
 
-Neuink is licensed under [Apache-2.0](LICENSE). Third-party component guidance is available in [NOTICE](NOTICE).
+Neuink is licensed under [Apache-2.0](LICENSE). Third-party components retain their own licences; see the [component summary](docs/deployment/third-party-components.md) (Chinese) and [NOTICE](NOTICE).

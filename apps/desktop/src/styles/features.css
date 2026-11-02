@@ -38,6 +38,17 @@
   scrollbar-width: auto;
 }
 
+.pdf-document-scroll[data-pdf-pan],
+.pdf-document-scroll[data-pdf-pan] * {
+  cursor: grab !important;
+  user-select: none !important;
+}
+
+.pdf-document-scroll[data-pdf-pan="dragging"],
+.pdf-document-scroll[data-pdf-pan="dragging"] * {
+  cursor: grabbing !important;
+}
+
 .pdf-document-scroll::-webkit-scrollbar {
   display: block;
   width: 10px;
@@ -428,6 +439,40 @@
   container-type: inline-size;
 }
 
+/* The outline is local to a note, never part of the global app sidebar. */
+.markdown-note-outline-slot {
+  width: 36px;
+}
+
+.markdown-note-outline-slot[data-open="true"] {
+  width: 180px;
+}
+
+.markdown-note-outline-sidebar {
+  width: 100%;
+}
+
+/* Formatting/header density follows the space left for the document, not the outline. */
+.markdown-note-main {
+  container-name: markdown-note-editor;
+  container-type: inline-size;
+}
+
+/* Keep a useful reading column when a note shares the workspace with a PDF. */
+@container markdown-note-editor (max-width: 760px) {
+  .markdown-note-outline-slot[data-open="true"] {
+    width: 36px;
+  }
+
+  .markdown-note-outline-slot[data-open="true"] > .markdown-note-outline-sidebar {
+    position: absolute;
+    inset: 0 auto 0 0;
+    z-index: var(--z-menu);
+    width: min(180px, calc(100cqw - 8px));
+    @apply shadow-md;
+  }
+}
+
 /* The parallel-reading frame already labels the owner; retain one compact
    note title/status/menu row at every split width, using the existing menu. */
 .markdown-note-editor-embedded :is(.markdown-note-entry-title, .markdown-note-header-divider, .markdown-note-header-actions) {
@@ -512,6 +557,7 @@
   .markdown-note-toolbar {
     gap: 4px;
   }
+
 }
 
 .source-snapshot-preview .katex {
@@ -593,6 +639,7 @@
 }
 
 .workspace-tab-pane {
+  position: relative;
   display: flex;
   flex: 1 1 auto;
   width: 100%;
@@ -604,11 +651,11 @@
 }
 
 .workspace-tabsbar-panes.is-split .workspace-tab-pane:last-child {
-  padding-right: 32px;
+  padding-right: 64px;
 }
 
 .workspace-tabsbar.has-pair-status .workspace-tab-pane:last-child {
-  padding-right: 86px;
+  padding-right: 118px;
 }
 
 .workspace-tabsbar:not(.is-split) .workspace-tab-pane {
@@ -743,7 +790,19 @@
   box-shadow: 0 1px 3px color-mix(in srgb, #000 12%, transparent);
 }
 
+.workspace-surface-tab.is-pinned {
+  border-left-color: var(--primary);
+}
+
+.workspace-tab-pin {
+  flex: 0 0 auto;
+  margin-right: 5px;
+  color: var(--muted-foreground);
+}
+
 .workspace-surface-tab > button:first-child {
+  display: inline-flex;
+  align-items: center;
   min-width: 0;
   flex: 1;
   justify-content: flex-start;
@@ -845,6 +904,19 @@
   container: reflow-toolbar / inline-size;
 }
 
+.reflow-reader-pane { container: reflow-reader / inline-size; }
+.reflow-document-scroll { padding: 24px 24px 24px calc(var(--reflow-rail-width, 48px) + 24px); }
+.reflow-reading-surface { font-size: var(--reflow-preferred-font-size, 16px); }
+
+@container reflow-reader (max-width: 600px) {
+  .reflow-document-scroll { padding: 16px 16px 16px calc(var(--reflow-rail-width, 48px) + 12px); }
+  .reflow-reading-surface { font-size: min(var(--reflow-preferred-font-size, 16px), max(14px, 4cqi)); }
+}
+
+@container reflow-reader (max-width: 420px) {
+  .reflow-document-scroll { padding-right: 10px; padding-left: calc(var(--reflow-rail-width, 48px) + 8px); }
+}
+
 /* Size to the pane, not the application viewport. At 220px an avatar column
    consumes the space needed by proposal controls; role labels stay visible. */
 .assistant-message-layout {
@@ -901,13 +973,50 @@
   .reflow-toolbar-menu { width: 28px; padding-inline: 0; }
 }
 
+@container reflow-toolbar (max-width: 420px) {
+  .reflow-toolbar [data-reader-compact-toolbar] { flex-wrap: wrap; }
+  .reflow-toolbar [data-reader-compact-toolbar] .reflow-toolbar-translation { order: 1; flex: 0 0 100%; padding-bottom: 4px; }
+}
+
 .pdf-reader-toolbar {
   container-name: pdf-reader-toolbar;
   container-type: inline-size;
+  font-family: var(--font-sans);
+}
+
+.pdf-reader-toolbar :is(button, input),
+[data-reader-compact-toolbar] :is(button, input) {
+  font-family: var(--font-sans);
+  font-size: 0.8rem;
+  line-height: 1.25rem;
+}
+
+.pdf-segment-preview .source-snapshot-preview {
+  font-size: inherit;
+  line-height: inherit;
+}
+
+.translation-replacement-preview .source-snapshot-preview,
+.translation-replacement-preview .source-snapshot-preview :is(h1, h2, h3, h4, h5, h6, p, li) {
+  font-size: inherit;
+  line-height: inherit;
+}
+
+.translation-replacement-preview .source-snapshot-preview :is(h1, h2, h3, h4, h5, h6) {
+  margin: 0;
 }
 
 .pdf-reader-toolbar-overflow {
   display: none;
+}
+
+.pdf-reader-toolbar .entry-content-header-actions {
+  max-width: 100%;
+  flex-wrap: nowrap;
+  justify-content: flex-start;
+  overflow-x: auto;
+  overflow-y: hidden;
+  scrollbar-width: thin;
 }
 
 .pdf-reader-translation-status {
@@ -1030,7 +1139,9 @@
   .pdf-reader-toolbar .entry-content-header-actions {
     flex-wrap: nowrap;
     justify-content: flex-start;
-    overflow: hidden;
+    overflow-x: auto;
+    overflow-y: hidden;
+    scrollbar-width: thin;
   }
 }
 
@@ -1213,4 +1324,27 @@
       0 0 0 2px color-mix(in srgb, var(--primary) 88%, transparent),
       0 0 0 6px color-mix(in srgb, var(--primary) 18%, transparent);
   }
+}
+@keyframes guide-demo-block-reveal {
+  from { opacity: 0; transform: scale(0.96); }
+  to { opacity: 1; transform: scale(1); }
+}
+
+@keyframes guide-demo-selection-reveal {
+  from { transform: scaleX(0); }
+  to { transform: scaleX(1); }
+}
+
+.guide-demo-block { animation: guide-demo-block-reveal 650ms ease-out both; }
+.guide-demo-selection {
+  background: color-mix(in srgb, var(--primary) 35%, transparent);
+  transform-origin: left center;
+  animation: guide-demo-selection-reveal 1s ease-out both;
+}
+.guide-demo-selection-toolbar {
+  animation: guide-demo-block-reveal 180ms ease-out 1s both;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .guide-demo-block, .guide-demo-selection, .guide-demo-selection-toolbar { animation: none; }
 }
