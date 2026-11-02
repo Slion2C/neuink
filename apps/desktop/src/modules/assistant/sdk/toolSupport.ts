@@ -8,6 +8,7 @@ import { formatSciverseSearchOutput } from './sciverseOutput';
 export { formatSciverseSearchOutput } from './sciverseOutput';
 import { isPdfTool, runPdfTool } from './pdfTools';
 import { entryContextWindow, formatReadEntryOutput, ENTRY_CONTEXT_MAX_CHARS } from './entryContext';
+import { selectDiverseEvidence } from './evidenceDiversity';
 export { formatReadEntryOutput } from './entryContext';
 
 import type {
@@ -466,11 +467,14 @@ export function formatSearchSegmentsOutput(
   results: SearchResults,
   addSource: (source: ConversationSourceLink) => number
 ) {
-  const hits = results.entries.flatMap((group) => group.hits).slice(0, 24);
-  const evidence = hits
+  // Hits arrive grouped by Entry, so re-rank globally with MMR and collapse
+  // segment notes/annotations that point at the same cited segment.
+  const segmentHits = results.entries
+    .flatMap((group) => group.hits)
     .filter((hit): hit is SearchHit & { target: { kind: 'segment'; entry_id: string; segment_uid: string; page_idx: number } } => hit.target.kind === 'segment')
-    .slice(0, 12)
-    .map((hit) => {
+    .map((hit) => ({ hit, key: `${hit.target.entry_id}:${hit.target.segment_uid}`, score: hit.score, text: hit.snippet }));
+  const evidence = selectDiverseEvidence(segmentHits, 12)
+    .map(({ hit }) => {
       const source: ConversationSourceLink = {
         entry_id: hit.target.entry_id,
         entry_title: hit.entry_title,

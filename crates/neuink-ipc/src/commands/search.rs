@@ -188,6 +188,9 @@ pub async fn search_segments<R: tauri::Runtime>(
     request: SearchSegmentsRequest,
 ) -> Result<SearchResults, String> {
     let embedding_model_dir = embedding_model_dir(&app)?;
+    // Must match the scope `rebuild_search_index` embeds, otherwise the semantic
+    // cache namespace never exists and hybrid search silently stays keyword-only.
+    let (options, include) = search_scope_options(true);
     tokio::task::spawn_blocking(move || {
         run_search(
             embedding_model_dir,
@@ -196,16 +199,8 @@ pub async fn search_segments<R: tauri::Runtime>(
             request.scope_entry_ids,
             request.mode,
             request.top_k.unwrap_or(20),
-            WorkspaceSearchOptions {
-                include_entry_meta: false,
-                include_notes: true,
-                include_segments: true,
-            },
-            SearchInclude {
-                entry_meta: false,
-                notes: true,
-                segments: true,
-            },
+            options,
+            include,
         )
     })
     .await
@@ -744,17 +739,19 @@ fn semantic_cache_key(
     )
 }
 
+/// The segments scope is the assistant's `search_segments` corpus: parsed
+/// segments plus the user's notes and annotations anchored to them.
 fn search_scope_options(segments_only: bool) -> (WorkspaceSearchOptions, SearchInclude) {
     if segments_only {
         (
             WorkspaceSearchOptions {
                 include_entry_meta: false,
-                include_notes: false,
+                include_notes: true,
                 include_segments: true,
             },
             SearchInclude {
                 entry_meta: false,
-                notes: false,
+                notes: true,
                 segments: true,
             },
         )
@@ -1330,10 +1327,37 @@ mod tests {
 
     use super::{
         begin_search_build, load_search_build_status, records_fingerprint,
-        search_build_status_path, update_search_build_progress, SearchIndexBuildState,
-        SearchIndexBuildStatus, WorkspaceSearchRecord, WorkspaceSearchRecordKind,
+        search_build_status_path, search_scope_options, semantic_cache_namespace,
+        update_search_build_progress, SearchIndexBuildState, SearchIndexBuildStatus,
+        WorkspaceSearchRecord, WorkspaceSearchRecordKind,
     };
     use neuink_domain::EntryId;
+    use neuink_search::SearchInclude;
+    use neuink_workspace::WorkspaceSearchOptions;
+
+    #[test]
+    fn segments_scope_matches_assistant_search_corpus() {
+        // `search_segments` searches segments plus anchored notes; the manual
+        // segments build must embed the same namespace or hybrid never finds it.
+        let root = std::path::PathBuf::from("workspace");
+        let assistant_options = WorkspaceSearchOptions {
+            include_entry_meta: false,
+            include_notes: true,
+            include_segments: true,
+        };
+        let assistant_include = SearchInclude {
+            entry_meta: false,
+            notes: true,
+            segments: true,
+        };
+        let (options, include) = search_scope_options(true);
+
+        assert_eq!(include, assistant_include);
+        assert_eq!(
+            semantic_cache_namespace(&root, &options, &include),
+            semantic_cache_namespace(&root, &assistant_options, &assistant_include)
+        );
+    }
 
     #[test]
     fn records_fingerprint_is_independent_of_directory_iteration_order() {
