@@ -20,12 +20,15 @@ pub use fastembed_provider::{
 pub use memory_index::MemorySearchIndex;
 pub use persistent_semantic_index::{
     merge_hybrid_results, semantic_index_path, semantic_result_mode, PersistentSemanticSearchIndex,
+    INDEX_FORMAT_VERSION, SEMANTIC_INDEX_FORMAT_VERSION,
 };
 pub use query::{SearchInclude, SearchMode, SearchQuery, SearchScope};
 pub use result::{
     SearchDocument, SearchDocumentSource, SearchDocumentSourceKind, SearchEntryGroup, SearchHit,
     SearchResults, SearchTarget, SearchTextSection,
 };
-pub use rrf::{reciprocal_rank_fusion, DEFAULT_RRF_K};
+pub use rrf::{
+    adaptive_hybrid_weights, reciprocal_rank_fusion, weighted_reciprocal_rank_fusion, DEFAULT_RRF_K,
+};
 pub use search_index_trait::SearchIndex;
 pub use vector_store_trait::{VectorRecord, VectorSearchHit, VectorStore};

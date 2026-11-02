@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs,
     hash::{DefaultHasher, Hash, Hasher},
     path::PathBuf,
@@ -12,8 +12,8 @@ use neuink_domain::EntryId;
 use neuink_search::{
     semantic_index_path, semantic_result_mode, EmbeddingProvider, FastEmbedProvider,
     MemorySearchIndex, PersistentSemanticSearchIndex, SearchDocument, SearchDocumentSource,
-    SearchDocumentSourceKind, SearchInclude, SearchIndex, SearchMode, SearchQuery, SearchResults,
-    SearchScope, SearchTarget, SearchTextSection,
+    SearchDocumentSourceKind, SearchEntryGroup, SearchInclude, SearchIndex, SearchMode,
+    SearchQuery, SearchResults, SearchScope, SearchTarget, SearchTextSection,
 };
 use neuink_workspace::{
     Workspace, WorkspaceLayout, WorkspaceSearchOptions, WorkspaceSearchRecord,
@@ -29,7 +29,7 @@ const EMBEDDING_PROVIDER_CACHE_LIMIT: usize = 1;
 const CACHE_TTL: Duration = Duration::from_secs(60 * 30);
 const CACHE_CLEANUP_INTERVAL: Duration = Duration::from_secs(60 * 5);
 const DISK_VECTOR_CACHE_TTL: Duration = Duration::from_secs(60 * 60 * 24 * 14);
-const SEMANTIC_INDEX_FORMAT_VERSION: u32 = 3;
+const SEMANTIC_INDEX_FORMAT_VERSION: u32 = 4;
 
 #[derive(Debug, Deserialize)]
 pub struct SearchEntriesRequest {
@@ -150,10 +150,12 @@ static DISK_VECTOR_CACHE_LAST_CLEANUP: OnceLock<Mutex<HashMap<String, Instant>>>
 static SEARCH_BUILD_STATUS: OnceLock<Mutex<HashMap<String, SearchIndexBuildStatus>>> =
     OnceLock::new();
 static SEMANTIC_BUILD_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+static SEMANTIC_AUTO_REBUILD_KEYS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
 
 pub fn spawn_search_cache_workers<R: tauri::Runtime>(_app: tauri::AppHandle<R>) {
-    // Semantic index building is user-initiated (rebuild_search_index); startup
-    // only keeps the periodic cache eviction loop alive.
+    // Keep cache eviction alive at startup. Legacy semantic snapshots are
+    // rebuilt lazily in a detached worker on the first semantic request, so
+    // keyword search remains available while the new index is prepared.
     thread::Builder::new()
         .name("neuink-search-cache-cleanup".to_string())
         .spawn(clean_search_caches_loop)
@@ -191,17 +193,20 @@ pub async fn search_segments<R: tauri::Runtime>(
     // Must match the scope `rebuild_search_index` embeds, otherwise the semantic
     // cache namespace never exists and hybrid search silently stays keyword-only.
     let (options, include) = search_scope_options(true);
+    let top_k = request.top_k.unwrap_or(20).clamp(1, 20);
+    let candidate_k = top_k.saturating_mul(5).max(60);
     tokio::task::spawn_blocking(move || {
-        run_search(
+        let results = run_search(
             embedding_model_dir,
             request.root,
             request.query,
             request.scope_entry_ids,
             request.mode,
-            request.top_k.unwrap_or(20),
+            candidate_k,
             options,
             include,
-        )
+        )?;
+        Ok(filter_segment_search_results(results, top_k))
     })
     .await
     .map_err(|error| error.to_string())?
@@ -500,21 +505,35 @@ fn run_semantic_search(
     }
 
     let provider = cached_embedding_provider(embedding_model_dir)?;
-    let semantic_index = try_cached_semantic_index(
+    let Some(semantic_index) = try_cached_semantic_index(
         root,
         options,
         records_fingerprint,
         &query.include,
         documents,
-    )
-    .ok_or_else(|| {
-        neuink_search::SearchError::EmbeddingUnavailable(
-            "向量索引尚未构建或已过期。请在搜索面板点击「构建向量索引」后再使用语义/混合搜索。"
-                .to_string(),
-        )
-    })?;
+    ) else {
+        schedule_legacy_semantic_rebuild(
+            root,
+            options,
+            records_fingerprint,
+            &query.include,
+            documents,
+            provider,
+        );
+        return Err(neuink_search::SearchError::EmbeddingUnavailable(
+            "向量索引尚未构建或正在后台重建；当前返回关键词结果。".to_string(),
+        ));
+    };
+    let candidate_limit = query.limit.saturating_mul(5).max(60);
+    let mut candidate_query = query.clone();
+    candidate_query.limit = candidate_limit;
+    let semantic_query = if query.mode == SearchMode::Hybrid {
+        &candidate_query
+    } else {
+        &query
+    };
     let semantic_results = semantic_index.search(
-        &query,
+        semantic_query,
         &normalized_query,
         provider.as_ref(),
         semantic_result_mode(query.mode),
@@ -526,7 +545,7 @@ fn run_semantic_search(
         return Ok(semantic_results);
     }
 
-    let mut keyword_query = query.clone();
+    let mut keyword_query = candidate_query;
     keyword_query.mode = SearchMode::Keyword;
     let keyword_results = keyword_index.search(keyword_query)?;
     Ok(neuink_search::merge_hybrid_results(
@@ -723,6 +742,80 @@ fn try_cached_semantic_index(
         trim_semantic_cache(&mut cache);
     }
     Some(index)
+}
+
+fn schedule_legacy_semantic_rebuild(
+    root: &PathBuf,
+    options: &WorkspaceSearchOptions,
+    records_fingerprint: u64,
+    include: &SearchInclude,
+    documents: &[SearchDocument],
+    provider: Arc<FastEmbedProvider>,
+) {
+    let cache_dir = WorkspaceLayout::new(root.clone()).cache_dir();
+    let namespace = semantic_cache_namespace(root, options, include);
+    let index_path = semantic_index_path(cache_dir, &namespace);
+    let cache_status = read_semantic_disk_cache_status(&index_path);
+    if !should_schedule_legacy_semantic_rebuild(cache_status.as_ref(), provider.status().available)
+    {
+        return;
+    }
+
+    let active_key = semantic_cache_key(root, options, include);
+    let active = SEMANTIC_AUTO_REBUILD_KEYS.get_or_init(|| Mutex::new(HashSet::new()));
+    let Ok(mut active_keys) = active.lock() else {
+        return;
+    };
+    if !active_keys.insert(active_key.clone()) {
+        return;
+    }
+    drop(active_keys);
+
+    let root = root.clone();
+    let options = options.clone();
+    let include = include.clone();
+    let documents = documents.to_vec();
+    let scope = if options.include_segments && !options.include_entry_meta {
+        "segments"
+    } else {
+        "global"
+    };
+    let worker_key = active_key.clone();
+    let spawn = thread::Builder::new()
+        .name("neuink-search-semantic-auto-rebuild".to_string())
+        .spawn(move || {
+            let result = cached_semantic_index(
+                &root,
+                &options,
+                records_fingerprint,
+                &include,
+                &documents,
+                provider,
+                Some(scope),
+            );
+            if let Err(error) = result {
+                fail_search_build(&root, &error.to_string());
+            }
+            if let Ok(mut active_keys) = SEMANTIC_AUTO_REBUILD_KEYS
+                .get_or_init(|| Mutex::new(HashSet::new()))
+                .lock()
+            {
+                active_keys.remove(&worker_key);
+            }
+        });
+    if spawn.is_err() {
+        if let Ok(mut active_keys) = active.lock() {
+            active_keys.remove(&active_key);
+        }
+    }
+}
+
+fn should_schedule_legacy_semantic_rebuild(
+    cache_status: Option<&SemanticDiskCacheStatus>,
+    provider_available: bool,
+) -> bool {
+    provider_available
+        && cache_status.is_some_and(|status| status.version != SEMANTIC_INDEX_FORMAT_VERSION)
 }
 
 fn semantic_cache_key(
@@ -1116,6 +1209,12 @@ fn search_document(record: WorkspaceSearchRecord) -> Option<SearchDocument> {
     };
     let label = source_label(&record);
 
+    let title_section = if record.kind == WorkspaceSearchRecordKind::Segment {
+        SearchTextSection::with_boost("title", record.title.clone(), 0.25)
+    } else {
+        SearchTextSection::title(record.title.clone())
+    };
+
     Some(SearchDocument {
         entry_id: record.entry_id,
         entry_title: record.entry_title,
@@ -1129,13 +1228,54 @@ fn search_document(record: WorkspaceSearchRecord) -> Option<SearchDocument> {
             page_idx: record.page_idx,
         },
         target,
-        title: record.title.clone(),
-        sections: vec![
-            SearchTextSection::title(record.title),
-            SearchTextSection::body(record.text),
-        ],
+        title: record.title,
+        sections: vec![title_section, SearchTextSection::body(record.text)],
         boost: source_boost(record.kind),
     })
+}
+
+fn filter_segment_search_results(mut results: SearchResults, limit: usize) -> SearchResults {
+    let mut hits = results
+        .entries
+        .into_iter()
+        .flat_map(|entry| entry.hits)
+        .filter(|hit| matches!(&hit.target, SearchTarget::Segment { .. }))
+        .collect::<Vec<_>>();
+    hits.sort_by(|left, right| {
+        right
+            .score
+            .partial_cmp(&left.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| left.entry_title.cmp(&right.entry_title))
+            .then_with(|| left.title.cmp(&right.title))
+    });
+    hits.truncate(limit);
+
+    let mut grouped = std::collections::BTreeMap::<String, SearchEntryGroup>::new();
+    for hit in hits {
+        let key = hit.entry_id.as_str().to_string();
+        let group = grouped.entry(key).or_insert_with(|| SearchEntryGroup {
+            entry_id: hit.entry_id.clone(),
+            entry_title: hit.entry_title.clone(),
+            hit_count: 0,
+            max_score: hit.score,
+            hits: Vec::new(),
+        });
+        group.hit_count += 1;
+        group.max_score = group.max_score.max(hit.score);
+        group.hits.push(hit);
+    }
+    let mut entries = grouped.into_values().collect::<Vec<_>>();
+    entries.sort_by(|left, right| {
+        right
+            .max_score
+            .partial_cmp(&left.max_score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| left.entry_title.cmp(&right.entry_title))
+    });
+    results.entries = entries;
+    results.total_hit_count = results.entries.iter().map(|entry| entry.hit_count).sum();
+    results
 }
 
 fn source_kind(kind: WorkspaceSearchRecordKind) -> SearchDocumentSourceKind {
@@ -1326,13 +1466,16 @@ mod tests {
     use std::{fs, time::SystemTime};
 
     use super::{
-        begin_search_build, load_search_build_status, records_fingerprint,
-        search_build_status_path, search_scope_options, semantic_cache_namespace,
-        update_search_build_progress, SearchIndexBuildState, SearchIndexBuildStatus,
-        WorkspaceSearchRecord, WorkspaceSearchRecordKind,
+        begin_search_build, filter_segment_search_results, load_search_build_status,
+        records_fingerprint, search_build_status_path, search_scope_options,
+        semantic_cache_namespace, update_search_build_progress, SearchIndexBuildState,
+        SearchIndexBuildStatus, WorkspaceSearchRecord, WorkspaceSearchRecordKind,
     };
     use neuink_domain::EntryId;
-    use neuink_search::SearchInclude;
+    use neuink_search::{
+        SearchDocumentSource, SearchDocumentSourceKind, SearchEntryGroup, SearchHit, SearchInclude,
+        SearchResults, SearchTarget,
+    };
     use neuink_workspace::WorkspaceSearchOptions;
 
     #[test]
@@ -1360,6 +1503,70 @@ mod tests {
     }
 
     #[test]
+    fn segment_scope_filters_pages_and_unanchored_notes_after_candidate_expansion() {
+        let entry_id = EntryId::from_string("entry-a");
+        let segment_uid = neuink_domain::SegmentUid::from_string("segment-a");
+        let hit = |target, kind| SearchHit {
+            entry_id: entry_id.clone(),
+            entry_title: "Paper".to_string(),
+            source: SearchDocumentSource {
+                kind,
+                ..Default::default()
+            },
+            target,
+            title: "hit".to_string(),
+            snippet: "body".to_string(),
+            score: 1.0,
+            matched_terms: Vec::new(),
+        };
+        let results = SearchResults {
+            query: "q".to_string(),
+            mode: "keyword".to_string(),
+            index_generation: 1,
+            total_hit_count: 3,
+            entries: vec![SearchEntryGroup {
+                entry_id: entry_id.clone(),
+                entry_title: "Paper".to_string(),
+                hit_count: 3,
+                max_score: 1.0,
+                hits: vec![
+                    hit(
+                        SearchTarget::Page {
+                            entry_id: entry_id.clone(),
+                            page_idx: 0,
+                        },
+                        SearchDocumentSourceKind::PdfPage,
+                    ),
+                    hit(
+                        SearchTarget::Note {
+                            entry_id: entry_id.clone(),
+                            note_id: neuink_domain::NoteId::from_string("note-a"),
+                        },
+                        SearchDocumentSourceKind::NoteBody,
+                    ),
+                    hit(
+                        SearchTarget::Segment {
+                            entry_id: entry_id.clone(),
+                            segment_uid,
+                            page_idx: 0,
+                        },
+                        SearchDocumentSourceKind::Segment,
+                    ),
+                ],
+            }],
+            warnings: Vec::new(),
+        };
+
+        let filtered = filter_segment_search_results(results, 1);
+
+        assert_eq!(filtered.total_hit_count, 1);
+        assert!(matches!(
+            filtered.entries[0].hits[0].target,
+            SearchTarget::Segment { .. }
+        ));
+    }
+
+    #[test]
     fn records_fingerprint_is_independent_of_directory_iteration_order() {
         let first = record("entry-a", "Alpha");
         let second = record("entry-b", "Beta");
@@ -1378,6 +1585,34 @@ mod tests {
             records_fingerprint(&[first]),
             records_fingerprint(&[changed])
         );
+    }
+
+    #[test]
+    fn legacy_semantic_cache_is_rebuilt_only_when_provider_and_version_require_it() {
+        let legacy = super::SemanticDiskCacheStatus {
+            version: super::SEMANTIC_INDEX_FORMAT_VERSION - 1,
+            fingerprint: 1,
+            record_count: 2,
+        };
+        let current = super::SemanticDiskCacheStatus {
+            version: super::SEMANTIC_INDEX_FORMAT_VERSION,
+            fingerprint: 1,
+            record_count: 2,
+        };
+
+        assert!(super::should_schedule_legacy_semantic_rebuild(
+            Some(&legacy),
+            true
+        ));
+        assert!(!super::should_schedule_legacy_semantic_rebuild(
+            Some(&legacy),
+            false
+        ));
+        assert!(!super::should_schedule_legacy_semantic_rebuild(
+            Some(&current),
+            true
+        ));
+        assert!(!super::should_schedule_legacy_semantic_rebuild(None, true));
     }
 
     #[test]

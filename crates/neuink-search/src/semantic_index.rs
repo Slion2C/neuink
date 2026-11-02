@@ -3,9 +3,9 @@ use std::{cmp::Ordering, collections::BTreeMap};
 use rayon::prelude::*;
 
 use crate::{
-    EmbeddingInput, EmbeddingProvider, SearchDocument, SearchDocumentSourceKind, SearchEntryGroup,
-    SearchHit, SearchInclude, SearchMode, SearchQuery, SearchResult, SearchResults,
-    SearchTextSection,
+    adaptive_hybrid_weights, weighted_reciprocal_rank_fusion, EmbeddingInput, EmbeddingProvider,
+    SearchDocument, SearchDocumentSourceKind, SearchEntryGroup, SearchHit, SearchInclude,
+    SearchMode, SearchQuery, SearchResult, SearchResults, SearchTextSection,
 };
 
 #[derive(Debug)]
@@ -63,7 +63,7 @@ impl InMemorySemanticSearchIndex {
         let query_vector = provider
             .embed(&[EmbeddingInput {
                 id: "query".to_string(),
-                text: normalized_query.to_string(),
+                text: format!("query: {normalized_query}"),
             }])?
             .into_iter()
             .next()
@@ -124,29 +124,25 @@ pub fn merge_hybrid_results(
 ) -> SearchResults {
     let keyword_hits = flatten_hits(keyword_results);
     let semantic_hits = flatten_hits(semantic_results);
-    let mut scored = Vec::<(String, SearchHit, f32)>::new();
-
-    for (rank, hit) in keyword_hits.into_iter().enumerate() {
-        let key = hit_key(&hit);
-        scored.push((key, hit, 1.0 / (60.0 + rank as f32 + 1.0)));
+    let top_keyword_terms = keyword_hits.first().map(|hit| hit.matched_terms.as_slice());
+    let (keyword_weight, semantic_weight) = adaptive_hybrid_weights(&query, top_keyword_terms);
+    let keyword_keys = keyword_hits.iter().map(hit_key).collect::<Vec<_>>();
+    let semantic_keys = semantic_hits.iter().map(hit_key).collect::<Vec<_>>();
+    let fused = weighted_reciprocal_rank_fusion(
+        &[keyword_keys, semantic_keys],
+        &[keyword_weight, semantic_weight],
+        60.0,
+    );
+    let mut hit_by_key = BTreeMap::<String, SearchHit>::new();
+    for hit in keyword_hits.into_iter().chain(semantic_hits) {
+        hit_by_key.entry(hit_key(&hit)).or_insert(hit);
     }
-
-    for (rank, hit) in semantic_hits.into_iter().enumerate() {
-        let key = hit_key(&hit);
-        scored.push((key, hit, 1.0 / (60.0 + rank as f32 + 1.0)));
-    }
-
-    let mut by_key = BTreeMap::<String, (SearchHit, f32)>::new();
-    for (key, hit, score) in scored {
-        let entry = by_key.entry(key).or_insert((hit, 0.0));
-        entry.1 += score;
-    }
-
-    let mut hits = by_key
-        .into_values()
-        .map(|(mut hit, score)| {
+    let mut hits = fused
+        .into_iter()
+        .filter_map(|(key, score)| {
+            let mut hit = hit_by_key.remove(&key)?;
             hit.score = score;
-            hit
+            Some(hit)
         })
         .collect::<Vec<_>>();
     hits.sort_by(compare_hits);
@@ -215,11 +211,16 @@ fn embedding_text(document: &SearchDocument) -> String {
         parts.push(document.title.trim().to_string());
     }
     for section in &document.sections {
+        if section.label == "title" {
+            continue;
+        }
         if let Some(text) = section_text(section) {
-            parts.push(text);
+            if text != document.title.trim() {
+                parts.push(text);
+            }
         }
     }
-    parts.join("\n")
+    format!("passage: {}", parts.join("\n"))
 }
 
 fn section_text(section: &SearchTextSection) -> Option<String> {
@@ -287,7 +288,11 @@ fn hit_key(hit: &SearchHit) -> String {
             format!("entry:{}:{source_kind}", entry_id.as_str())
         }
         crate::SearchTarget::Note { entry_id, note_id } => {
-            format!("note:{}:{}:{source_kind}", entry_id.as_str(), note_id.as_str())
+            format!(
+                "note:{}:{}:{source_kind}",
+                entry_id.as_str(),
+                note_id.as_str()
+            )
         }
         crate::SearchTarget::Page { entry_id, page_idx } => {
             format!("page:{}:{}:{source_kind}", entry_id.as_str(), page_idx)
@@ -310,5 +315,34 @@ pub fn semantic_result_mode(mode: SearchMode) -> &'static str {
         SearchMode::Keyword => "keyword",
         SearchMode::Semantic => "semantic",
         SearchMode::Hybrid => "semantic",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::embedding_text;
+    use crate::{SearchDocument, SearchDocumentSource, SearchTarget, SearchTextSection};
+    use neuink_domain::EntryId;
+
+    #[test]
+    fn embedding_text_uses_one_passage_prefix_and_one_title() {
+        let entry_id = EntryId::from_string("entry-a");
+        let document = SearchDocument {
+            entry_id: entry_id.clone(),
+            entry_title: "Entry title".to_string(),
+            source: SearchDocumentSource::default(),
+            target: SearchTarget::Entry { entry_id },
+            title: "Display title".to_string(),
+            sections: vec![
+                SearchTextSection::title("Display title"),
+                SearchTextSection::body("Clean body"),
+            ],
+            boost: 1.0,
+        };
+
+        assert_eq!(
+            embedding_text(&document),
+            "passage: Display title\nClean body"
+        );
     }
 }

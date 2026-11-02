@@ -286,9 +286,18 @@ fn index_document((doc_idx, document): (usize, SearchDocument)) -> LocalIndexedD
             length += section.boost;
         }
     }
-    for token in tokenize(&document.title) {
-        *term_weights.entry(token).or_insert(0.0) += 2.0;
-        length += 2.0;
+    // `document.title` is the display title and is usually also represented by
+    // a title section. Index it only as a fallback so a segment label cannot be
+    // counted twice in the high-weight field.
+    if !document
+        .sections
+        .iter()
+        .any(|section| section.label == "title")
+    {
+        for token in tokenize(&document.title) {
+            *term_weights.entry(token).or_insert(0.0) += 2.0;
+            length += 2.0;
+        }
     }
 
     let text_for_snippet = document.text_for_snippet();
@@ -453,6 +462,31 @@ mod tests {
 
         assert_eq!(results.total_hit_count, 1);
         assert_eq!(results.entries[0].entry_id, entry_id);
+    }
+
+    #[test]
+    fn display_title_is_not_counted_again_when_title_section_exists() {
+        let entry_id = EntryId::from_string("entry-a");
+        let document = SearchDocument {
+            entry_id: entry_id.clone(),
+            entry_title: "Paper".to_string(),
+            source: SearchDocumentSource::default(),
+            target: SearchTarget::Entry { entry_id },
+            title: "PDF Segment · Page 1 · paragraph".to_string(),
+            sections: vec![
+                SearchTextSection::with_boost("title", "PDF Segment · Page 1 · paragraph", 0.25),
+                SearchTextSection::body("clean body"),
+            ],
+            boost: 1.0,
+        };
+
+        let indexed = index_document((0, document));
+        let paragraph_weight = indexed
+            .term_weights
+            .get("paragraph")
+            .copied()
+            .expect("title token");
+        assert!((paragraph_weight - 0.25).abs() < f32::EPSILON);
     }
 
     #[test]

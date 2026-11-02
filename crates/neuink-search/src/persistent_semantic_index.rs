@@ -10,12 +10,14 @@ use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    EmbeddingInput, EmbeddingProvider, SearchDocument, SearchDocumentSourceKind, SearchEntryGroup,
-    SearchError, SearchHit, SearchInclude, SearchMode, SearchQuery, SearchResult, SearchResults,
-    SearchTarget, SearchTextSection,
+    adaptive_hybrid_weights, weighted_reciprocal_rank_fusion, EmbeddingInput, EmbeddingProvider,
+    SearchDocument, SearchDocumentSourceKind, SearchEntryGroup, SearchError, SearchHit,
+    SearchInclude, SearchMode, SearchQuery, SearchResult, SearchResults, SearchTarget,
+    SearchTextSection,
 };
 
-const INDEX_FORMAT_VERSION: u32 = 3;
+pub const INDEX_FORMAT_VERSION: u32 = 4;
+pub const SEMANTIC_INDEX_FORMAT_VERSION: u32 = INDEX_FORMAT_VERSION;
 
 #[derive(Debug)]
 pub struct PersistentSemanticSearchIndex {
@@ -138,7 +140,7 @@ impl PersistentSemanticSearchIndex {
         let query_vector = provider
             .embed(&[EmbeddingInput {
                 id: "query".to_string(),
-                text: normalized_query.to_string(),
+                text: format!("query: {normalized_query}"),
             }])?
             .into_iter()
             .next()
@@ -195,7 +197,8 @@ impl PersistentSemanticSearchIndex {
         let Ok(snapshot) = serde_json::from_slice::<PersistedSemanticIndex>(&bytes) else {
             return Ok(None);
         };
-        if snapshot.version != INDEX_FORMAT_VERSION || snapshot.fingerprint != fingerprint {
+        if snapshot.version != SEMANTIC_INDEX_FORMAT_VERSION || snapshot.fingerprint != fingerprint
+        {
             return Ok(None);
         }
 
@@ -217,7 +220,7 @@ impl PersistentSemanticSearchIndex {
         let Ok(snapshot) = serde_json::from_slice::<PersistedSemanticIndex>(&bytes) else {
             return Ok(HashMap::new());
         };
-        if snapshot.version != INDEX_FORMAT_VERSION {
+        if snapshot.version != SEMANTIC_INDEX_FORMAT_VERSION {
             return Ok(HashMap::new());
         }
         Ok(snapshot
@@ -233,7 +236,7 @@ impl PersistentSemanticSearchIndex {
         }
 
         let snapshot = PersistedSemanticIndex {
-            version: INDEX_FORMAT_VERSION,
+            version: SEMANTIC_INDEX_FORMAT_VERSION,
             fingerprint,
             records: self
                 .documents
@@ -302,29 +305,25 @@ pub fn merge_hybrid_results(
 ) -> SearchResults {
     let keyword_hits = flatten_hits(keyword_results);
     let semantic_hits = flatten_hits(semantic_results);
-    let mut scored = Vec::<(String, SearchHit, f32)>::new();
-
-    for (rank, hit) in keyword_hits.into_iter().enumerate() {
-        let key = hit_key(&hit);
-        scored.push((key, hit, 1.0 / (60.0 + rank as f32 + 1.0)));
+    let top_keyword_terms = keyword_hits.first().map(|hit| hit.matched_terms.as_slice());
+    let (keyword_weight, semantic_weight) = adaptive_hybrid_weights(&query, top_keyword_terms);
+    let keyword_keys = keyword_hits.iter().map(hit_key).collect::<Vec<_>>();
+    let semantic_keys = semantic_hits.iter().map(hit_key).collect::<Vec<_>>();
+    let fused = weighted_reciprocal_rank_fusion(
+        &[keyword_keys, semantic_keys],
+        &[keyword_weight, semantic_weight],
+        60.0,
+    );
+    let mut hit_by_key = BTreeMap::<String, SearchHit>::new();
+    for hit in keyword_hits.into_iter().chain(semantic_hits) {
+        hit_by_key.entry(hit_key(&hit)).or_insert(hit);
     }
-
-    for (rank, hit) in semantic_hits.into_iter().enumerate() {
-        let key = hit_key(&hit);
-        scored.push((key, hit, 1.0 / (60.0 + rank as f32 + 1.0)));
-    }
-
-    let mut by_key = BTreeMap::<String, (SearchHit, f32)>::new();
-    for (key, hit, score) in scored {
-        let entry = by_key.entry(key).or_insert((hit, 0.0));
-        entry.1 += score;
-    }
-
-    let mut hits = by_key
-        .into_values()
-        .map(|(mut hit, score)| {
+    let mut hits = fused
+        .into_iter()
+        .filter_map(|(key, score)| {
+            let mut hit = hit_by_key.remove(&key)?;
             hit.score = score;
-            hit
+            Some(hit)
         })
         .collect::<Vec<_>>();
     hits.sort_by(compare_hits);
@@ -409,7 +408,7 @@ mod tests {
         time::{SystemTime, UNIX_EPOCH},
     };
 
-    use super::{stable_document_key, PersistentSemanticSearchIndex};
+    use super::{embedding_text, stable_document_key, PersistentSemanticSearchIndex};
     use crate::{
         EmbeddingInput, EmbeddingProvider, EmbeddingProviderStatus, EmbeddingVector,
         SearchDocument, SearchDocumentSource, SearchInclude, SearchResult, SearchTarget,
@@ -433,6 +432,12 @@ mod tests {
             stable_document_key(&document("entry-a", "Alpha")),
             stable_document_key(&document("entry-a", "Changed"))
         );
+    }
+
+    #[test]
+    fn embedding_text_uses_one_passage_prefix_and_one_title() {
+        let document = document("entry-a", "Alpha");
+        assert_eq!(embedding_text(&document), "passage: Alpha");
     }
 
     #[test]
@@ -597,22 +602,21 @@ fn group_hits(
 }
 
 fn embedding_text(document: &SearchDocument) -> String {
-    let mut parts = Vec::with_capacity(document.sections.len() + 4);
-    if !document.entry_title.trim().is_empty() {
-        parts.push(format!("Entry: {}", document.entry_title.trim()));
-    }
+    let mut parts = Vec::with_capacity(document.sections.len() + 1);
     if !document.title.trim().is_empty() {
-        parts.push(format!("Title: {}", document.title.trim()));
-    }
-    if !document.source.label.trim().is_empty() {
-        parts.push(format!("Source: {}", document.source.label.trim()));
+        parts.push(document.title.trim().to_string());
     }
     for section in &document.sections {
+        if section.label == "title" {
+            continue;
+        }
         if let Some(text) = section_text(section) {
-            parts.push(format!("{}: {}", section.label, text));
+            if text != document.title.trim() {
+                parts.push(text);
+            }
         }
     }
-    parts.join("\n")
+    format!("passage: {}", parts.join("\n"))
 }
 
 fn section_text(section: &SearchTextSection) -> Option<String> {
