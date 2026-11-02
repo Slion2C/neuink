@@ -238,6 +238,8 @@ pub fn list_tools<R: tauri::Runtime>(app: tauri::AppHandle<R>) -> Vec<ToolDescri
                 "properties": {
                     "root": {"type": "string"},
                     "query": {"type": "string"},
+                    "english_query": {"type": "string", "description": "Optional English academic query for Chinese questions about English papers."},
+                    "sub_queries": {"type": "array", "items": {"type": "string"}, "maxItems": 3},
                     "scope_entry_ids": {"type": "array", "items": {"type": "string"}},
                     "mode": {"type": "string", "enum": ["keyword", "semantic", "hybrid"]},
                     "top_k": {"type": "number"}
@@ -904,6 +906,10 @@ async fn invoke_search_segments<R: tauri::Runtime>(
         root: PathBuf,
         query: String,
         #[serde(default)]
+        english_query: Option<String>,
+        #[serde(default)]
+        sub_queries: Vec<String>,
+        #[serde(default)]
         scope_entry_ids: Vec<EntryId>,
         #[serde(default)]
         mode: Option<SearchMode>,
@@ -917,6 +923,8 @@ async fn invoke_search_segments<R: tauri::Runtime>(
         SearchSegmentsRequest {
             root: args.root,
             query: args.query,
+            english_query: args.english_query,
+            sub_queries: args.sub_queries,
             scope_entry_ids: args.scope_entry_ids,
             mode: args.mode.unwrap_or(SearchMode::Hybrid),
             top_k: args.top_k,

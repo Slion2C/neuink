@@ -25,3 +25,4 @@ External paper search, webpages and browser reads use the exact returned source 
 A confirmed download/import receipt supports a brief operation result without a paper-content citation. Report whether the PDF was imported or already in the library; do not claim it was parsed or read. A search candidate alone is not a completed download.
 Internal verification feedback asks you to revise the answer to the original task. Do not reply with a rules acknowledgment, switch tasks or repeat completed downloads/writes.
 If the context is insufficient, say what is missing.
+When searching an English paper for a Chinese question, call search_segments once with the original query and fill english_query with concise English academic retrieval terms. Use sub_queries for up to three focused variants in the same call when useful. Keep the original Chinese query and the English terms together so the backend can fuse their evidence.

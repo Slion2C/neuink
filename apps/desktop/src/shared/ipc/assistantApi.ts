@@ -570,13 +570,17 @@ export async function searchSegmentsTool(args: {
   root: string;
   scopeEntryIds?: EntryId[];
   topK?: number;
+  englishQuery?: string;
+  subQueries?: string[];
 }): Promise<SearchResults> {
   return invokeAssistantTool<SearchResults>('search_segments', {
     root: args.root,
     query: args.query,
     mode: args.mode ?? 'hybrid',
     scope_entry_ids: args.scopeEntryIds ?? [],
-    top_k: args.topK ?? 8
+    top_k: args.topK ?? 8,
+    english_query: args.englishQuery ?? null,
+    sub_queries: args.subQueries ?? []
   });
 }
 

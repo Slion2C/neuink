@@ -1197,6 +1197,8 @@ export async function searchSegments(
     topK?: number;
     mode?: SearchMode;
     scopeEntryIds?: EntryId[];
+    englishQuery?: string;
+    subQueries?: string[];
   } = {}
 ): Promise<SearchResults> {
   return invoke<SearchResults>('search_segments', {
@@ -1205,7 +1207,9 @@ export async function searchSegments(
       query,
       top_k: options.topK ?? null,
       mode: options.mode ?? 'keyword',
-      scope_entry_ids: options.scopeEntryIds ?? []
+      scope_entry_ids: options.scopeEntryIds ?? [],
+      english_query: options.englishQuery ?? null,
+      sub_queries: options.subQueries ?? []
     }
   });
 }

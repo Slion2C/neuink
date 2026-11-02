@@ -3254,6 +3254,7 @@ dependencies = [
  "neuink-search",
  "neuink-workspace",
  "quick-xml 0.39.4",
+ "rayon",
  "reqwest 0.12.28",
  "scraper",
  "serde",

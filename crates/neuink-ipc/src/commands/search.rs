@@ -7,6 +7,7 @@ use std::{
     thread,
     time::{Duration, Instant, SystemTime},
 };
+use rayon::prelude::*;
 
 use neuink_domain::EntryId;
 use neuink_search::{
@@ -47,6 +48,10 @@ pub struct SearchEntriesRequest {
 pub struct SearchSegmentsRequest {
     pub root: PathBuf,
     pub query: String,
+    #[serde(default)]
+    pub english_query: Option<String>,
+    #[serde(default)]
+    pub sub_queries: Vec<String>,
     #[serde(default)]
     pub scope_entry_ids: Vec<EntryId>,
     #[serde(default)]
@@ -195,21 +200,183 @@ pub async fn search_segments<R: tauri::Runtime>(
     let (options, include) = search_scope_options(true);
     let top_k = request.top_k.unwrap_or(20).clamp(1, 20);
     let candidate_k = top_k.saturating_mul(5).max(60);
+    let primary_query = request.query.trim().to_string();
+    if primary_query.is_empty() {
+        return Err("query is required".to_string());
+    }
+    let mut queries = vec![(primary_query.clone(), 1.0_f32)];
+    if let Some(english_query) = request
+        .english_query
+        .as_deref()
+        .map(str::trim)
+        .filter(|query| !query.is_empty())
+    {
+        queries.push((english_query.to_string(), 0.9));
+    }
+    for sub_query in request
+        .sub_queries
+        .into_iter()
+        .map(|query| query.trim().to_string())
+        .filter(|query| !query.is_empty())
+        .take(3)
+    {
+        queries.push((sub_query, 0.75));
+    }
+    let scope_entry_ids = request.scope_entry_ids;
+    let mode = request.mode;
+    let has_english_query = queries.len() > 1;
     tokio::task::spawn_blocking(move || {
-        let results = run_search(
-            embedding_model_dir,
-            request.root,
-            request.query,
-            request.scope_entry_ids,
-            request.mode,
-            candidate_k,
-            options,
-            include,
-        )?;
+        let search_results = queries
+            .par_iter()
+            .map(|(query, _)| {
+                run_search(
+                    embedding_model_dir.clone(),
+                    request.root.clone(),
+                    query.clone(),
+                    scope_entry_ids.clone(),
+                    mode,
+                    candidate_k,
+                    options.clone(),
+                    include.clone(),
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let weights = queries.iter().map(|(_, weight)| *weight).collect::<Vec<_>>();
+        let mut results = merge_query_results(primary_query, search_results, &weights);
+        if contains_cjk(&results.query)
+            && !has_english_query
+            && results.mode.contains("fallback")
+        {
+            results.warnings.push(
+                "中文查询未提供 english_query，且语义索引不可用；英文论文可能没有关键词交集，请配置模型或同时提供英文检索词。"
+                    .to_string(),
+            );
+        }
         Ok(filter_segment_search_results(results, top_k))
     })
     .await
     .map_err(|error| error.to_string())?
+}
+
+fn contains_cjk(text: &str) -> bool {
+    text.chars().any(|ch| matches!(ch, '\u{3400}'..='\u{4dbf}' | '\u{4e00}'..='\u{9fff}'))
+}
+
+fn merge_query_results(
+    query: String,
+    results: Vec<SearchResults>,
+    weights: &[f32],
+) -> SearchResults {
+    let Some(first) = results.first() else {
+        return SearchResults {
+            query,
+            mode: "keyword".to_string(),
+            index_generation: 0,
+            total_hit_count: 0,
+            entries: Vec::new(),
+            warnings: Vec::new(),
+        };
+    };
+    if results.len() == 1 {
+        let mut result = first.clone();
+        result.query = query;
+        return result;
+    }
+
+    let ranked = results
+        .iter()
+        .map(|result| {
+            result
+                .entries
+                .iter()
+                .flat_map(|entry| entry.hits.iter())
+                .map(|hit| search_hit_key(hit))
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    let fused = neuink_search::weighted_reciprocal_rank_fusion(&ranked, weights, 60.0);
+    let mut hits_by_key = std::collections::BTreeMap::new();
+    for result in results.iter() {
+        for hit in result.entries.iter().flat_map(|entry| entry.hits.iter()) {
+            hits_by_key
+                .entry(search_hit_key(hit))
+                .or_insert_with(|| hit.clone());
+        }
+    }
+    let mut hits = fused
+        .into_iter()
+        .filter_map(|(key, score)| {
+            let mut hit = hits_by_key.remove(&key)?;
+            hit.score = score;
+            Some(hit)
+        })
+        .collect::<Vec<_>>();
+    hits.sort_by(|left, right| {
+        right
+            .score
+            .partial_cmp(&left.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| left.entry_title.cmp(&right.entry_title))
+            .then_with(|| left.title.cmp(&right.title))
+    });
+    let mut warnings = results
+        .iter()
+        .flat_map(|result| result.warnings.iter().cloned())
+        .collect::<Vec<_>>();
+    warnings.sort();
+    warnings.dedup();
+    let mode = if first.mode.contains("fallback") {
+        first.mode.clone()
+    } else {
+        "hybrid".to_string()
+    };
+    let mut grouped = std::collections::BTreeMap::<String, SearchEntryGroup>::new();
+    for hit in hits {
+        let key = hit.entry_id.as_str().to_string();
+        let group = grouped.entry(key).or_insert_with(|| SearchEntryGroup {
+            entry_id: hit.entry_id.clone(),
+            entry_title: hit.entry_title.clone(),
+            hit_count: 0,
+            max_score: hit.score,
+            hits: Vec::new(),
+        });
+        group.hit_count += 1;
+        group.max_score = group.max_score.max(hit.score);
+        group.hits.push(hit);
+    }
+    let mut entries = grouped.into_values().collect::<Vec<_>>();
+    entries.sort_by(|left, right| {
+        right
+            .max_score
+            .partial_cmp(&left.max_score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| left.entry_title.cmp(&right.entry_title))
+    });
+    SearchResults {
+        query,
+        mode,
+        index_generation: first.index_generation,
+        total_hit_count: entries.iter().map(|entry| entry.hit_count).sum(),
+        entries,
+        warnings,
+    }
+}
+
+fn search_hit_key(hit: &neuink_search::SearchHit) -> String {
+    match &hit.target {
+        neuink_search::SearchTarget::Segment {
+            entry_id,
+            segment_uid,
+            ..
+        } => format!("segment:{}:{}", entry_id, segment_uid),
+        neuink_search::SearchTarget::Page { entry_id, page_idx } => {
+            format!("page:{}:{}", entry_id, page_idx)
+        }
+        neuink_search::SearchTarget::Note { entry_id, note_id } => {
+            format!("note:{}:{}", entry_id, note_id)
+        }
+        neuink_search::SearchTarget::Entry { entry_id } => format!("entry:{}", entry_id),
+    }
 }
 
 #[tauri::command]
@@ -1226,10 +1393,21 @@ fn search_document(record: WorkspaceSearchRecord) -> Option<SearchDocument> {
             note_id: record.note_id,
             segment_uid: record.segment_uid,
             page_idx: record.page_idx,
+            ..Default::default()
         },
         target,
         title: record.title,
-        sections: vec![title_section, SearchTextSection::body(record.text)],
+        sections: {
+            let mut sections = vec![title_section, SearchTextSection::body(record.text)];
+            if let Some(translation) = record.translation {
+                sections.push(SearchTextSection::with_boost(
+                    "translation",
+                    translation,
+                    0.85,
+                ));
+            }
+            sections
+        },
         boost: source_boost(record.kind),
     })
 }
@@ -1452,6 +1630,7 @@ fn records_fingerprint(records: &[WorkspaceSearchRecord]) -> u64 {
         record.segment_uid.hash(&mut record_hasher);
         record.page_idx.hash(&mut record_hasher);
         record.segment_type.hash(&mut record_hasher);
+        record.translation.hash(&mut record_hasher);
         record_fingerprints.push(record_hasher.finish());
     }
     record_fingerprints.sort_unstable();
@@ -1704,6 +1883,7 @@ mod tests {
             segment_uid: None,
             page_idx: None,
             segment_type: None,
+            translation: None,
         }
     }
 }

@@ -17,6 +17,7 @@ neuink-search = { path = "../neuink-search" }
 neuink-sciverse = { path = "../neuink-sciverse" }
 neuink-workspace = { path = "../neuink-workspace" }
 futures-util.workspace = true
+rayon.workspace = true
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true

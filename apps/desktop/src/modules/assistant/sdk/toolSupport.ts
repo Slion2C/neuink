@@ -214,7 +214,9 @@ export function normalizeToolInput(
       query: requiredString(object.query, 'query'),
       mode: searchMode(object.mode),
       scope_entry_ids: scopedEntryIds(object.scope_entry_ids, scope),
-      top_k: clampTopK(object.top_k)
+      top_k: clampTopK(object.top_k),
+      ...(optionalString(object.english_query) ? { english_query: optionalString(object.english_query) } : {}),
+      sub_queries: stringArray(object.sub_queries).map(query => query.trim()).filter(Boolean).slice(0, 3)
     };
   }
 
@@ -1478,6 +1480,8 @@ export function modelInputSchema(descriptor: AssistantToolDescriptor): JSONSchem
   describeProperty(objectSchema, 'mode', 'Search mode. Prefer hybrid for content lookup; use keyword for exact terms.');
   describeProperty(objectSchema, 'scope_entry_ids', 'Optional Entry ids. Omit this to use the current Neuink scope.');
   describeProperty(objectSchema, 'top_k', 'Optional maximum number of segment hits to return.');
+  describeProperty(objectSchema, 'english_query', 'Optional English academic query. For a Chinese question about an English paper, provide this in the same search_segments call.');
+  describeProperty(objectSchema, 'sub_queries', 'Optional additional focused queries, at most three.');
   describeProperty(objectSchema, 'entry_id', 'Required Entry id for explicit Entry or segment reads.');
   describeProperty(objectSchema, 'segment_uid', 'Segment uid returned by search_segments.');
   describeProperty(objectSchema, 'doc_id', 'Sciverse document id returned by search_sciverse_evidence.');
@@ -1517,7 +1521,7 @@ export function describeProperty(
 
 export function toolDescription(descriptor: AssistantToolDescriptor) {
   if (descriptor.name === 'search_segments') {
-    return `${descriptor.description} Use this for find/locate questions and questions about experiments, methods, datasets, results, tables, figures, or conclusions.`;
+    return `${descriptor.description} Use this for find/locate questions and questions about experiments, methods, datasets, results, tables, figures, or conclusions. For a Chinese question about an English paper, fill english_query in the same call with concise English academic terms; use sub_queries for up to three focused variants.`;
   }
   if (descriptor.name === 'read_segment_content') {
     return `${descriptor.description} Use this after search_segments when a snippet is not enough.`;
