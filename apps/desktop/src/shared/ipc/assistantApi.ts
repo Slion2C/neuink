@@ -308,6 +308,24 @@ export type ReadEntryAssistantContextResponse = {
   sources: EntryAssistantSource[];
 };
 
+export type GetEntryOutlineResponse = {
+  entry_id: EntryId;
+  entry_title: string;
+  compact_summary?: string;
+  sections: Array<{
+    section_id: string;
+    title: string;
+    level: number;
+    section_path: string;
+    role: string;
+    segment_count: number;
+    start_page_idx?: number;
+    end_page_idx?: number;
+    table_count?: number;
+    figure_count?: number;
+  }>;
+};
+
 export type AssistantContextSnapshotPinnedSegment = {
   entryId: EntryId;
   segmentUid: string;
@@ -581,6 +599,16 @@ export async function searchSegmentsTool(args: {
     top_k: args.topK ?? 8,
     english_query: args.englishQuery ?? null,
     sub_queries: args.subQueries ?? []
+  });
+}
+
+export async function getEntryOutlineTool(args: {
+  root: string;
+  entryId: EntryId;
+}): Promise<GetEntryOutlineResponse> {
+  return invokeAssistantTool<GetEntryOutlineResponse>('get_entry_outline', {
+    root: args.root,
+    entry_id: args.entryId
   });
 }
 

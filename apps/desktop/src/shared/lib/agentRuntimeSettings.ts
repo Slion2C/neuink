@@ -25,6 +25,7 @@ const DEFAULT_MAIN_TOOL_IDS: AgentToolId[] = [
   'app.set_appearance',
   'create_entry',
   'search_segments',
+  'get_entry_outline',
   'read_segment_content',
   'read_entry_assistant_context',
   'search_sciverse_evidence',
@@ -42,6 +43,7 @@ const DEFAULT_MAIN_TOOL_IDS: AgentToolId[] = [
 const EVIDENCE_TOOL_IDS: AgentToolId[] = [
   'read_pdf_pages', 'search_pdf_text',
   'search_segments',
+  'get_entry_outline',
   'read_segment_content',
   'read_entry_assistant_context',
   'search_sciverse_evidence',
@@ -100,7 +102,7 @@ function createSubagent(
 }
 
 export const DEFAULT_AGENT_RUNTIME_SETTINGS: AgentRuntimeSettings = {
-  capabilityRevision: 3,
+  capabilityRevision: 4,
   mainAssistant: createMainAssistant({}),
   mcpServers: [],
   subagents: [
@@ -147,7 +149,7 @@ export function normalizeAgentRuntimeSettings(
     return DEFAULT_AGENT_RUNTIME_SETTINGS;
   }
   return {
-    capabilityRevision: 3,
+    capabilityRevision: 4,
     mainAssistant: normalizeMainAssistant(settings.mainAssistant, settings.capabilityRevision ?? 0),
     mcpServers: normalizeMcpServers(settings.mcpServers),
     subagents: normalizeSubagents(settings.subagents),
@@ -156,7 +158,7 @@ export function normalizeAgentRuntimeSettings(
   };
 }
 
-function normalizeMainAssistant(value: unknown, revision = 3) {
+function normalizeMainAssistant(value: unknown, revision = 4) {
   if (!value || typeof value !== 'object') {
     return DEFAULT_AGENT_RUNTIME_SETTINGS.mainAssistant;
   }
@@ -170,6 +172,7 @@ function normalizeMainAssistant(value: unknown, revision = 3) {
     ...(revision < 1 && hadStandardTools ? research : []), ...(revision < 2 && hadStandardTools ? pdf : [])])];
   const hadCompletePreviousGrant = DEFAULT_MAIN_TOOL_IDS.filter(id => id !== 'read_browser_tab').every(id => migratedTools.includes(id));
   if (revision < 3 && hadCompletePreviousGrant && normalized.permissions.canInvokeTools) migratedTools.push('read_browser_tab');
+  if (revision < 4 && hadCompletePreviousGrant && normalized.permissions.canInvokeTools) migratedTools.push('get_entry_outline');
   return {
     ...normalized,
     allowedSubagentIds: normalized.allowedSubagentIds.filter((id) => id !== 'patch-planner-agent'),

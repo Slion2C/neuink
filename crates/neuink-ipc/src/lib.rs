@@ -124,6 +124,7 @@ pub fn register_commands<R: tauri::Runtime>(builder: tauri::Builder<R>) -> tauri
             commands::assistant::get_assistant_context_snapshot,
             commands::assistant::read_entry_assistant_context,
             commands::assistant::read_segment_content,
+            commands::assistant::get_entry_outline,
             commands::conversation::list_conversations,
             commands::conversation::load_conversation,
             commands::conversation::delete_conversation,
