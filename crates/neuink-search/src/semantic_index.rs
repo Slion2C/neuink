@@ -211,12 +211,16 @@ fn embedding_text(document: &SearchDocument) -> String {
         parts.push(document.title.trim().to_string());
     }
     for section in &document.sections {
-        if section.label == "title" {
+        if matches!(section.label.as_str(), "title" | "translation") {
             continue;
         }
         if let Some(text) = section_text(section) {
             if text != document.title.trim() {
-                parts.push(text);
+                parts.push(if section.label == "section_path" {
+                    format!("[{}]", text)
+                } else {
+                    text
+                });
             }
         }
     }

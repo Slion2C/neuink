@@ -1,11 +1,11 @@
 use std::collections::{BTreeMap, HashSet};
 
 use neuink_domain::{
-    AnnotationImportance, ContentItem, EntryId, NoteId, PdfParseStatus, SegmentType, SegmentUid,
-    SourceSegment, TagId, TagMeta,
+    AnnotationImportance, CanonicalSectionRole, ContentItem, EntryId, NoteId, PdfParseStatus,
+    SegmentType, SegmentUid, SourceSegment, TagId, TagMeta,
 };
 
-use crate::{Workspace, WorkspaceError};
+use crate::{TranslatedSegmentStatus, Workspace, WorkspaceError};
 
 #[derive(Clone, Debug)]
 pub struct WorkspaceSearchOptions {
@@ -38,6 +38,10 @@ pub struct WorkspaceSearchRecord {
     pub segment_uid: Option<SegmentUid>,
     pub page_idx: Option<u32>,
     pub segment_type: Option<SegmentType>,
+    pub section_id: Option<String>,
+    pub section_path: Option<String>,
+    pub section_role: Option<CanonicalSectionRole>,
+    pub caption: Option<String>,
     /// Existing paragraph translation, kept separate so semantic indexing can
     /// deliberately exclude it while BM25F can use it as a secondary field.
     pub translation: Option<String>,
@@ -84,6 +88,10 @@ impl Workspace {
                     segment_uid: None,
                     page_idx: None,
                     segment_type: None,
+                    section_id: None,
+                    section_path: None,
+                    section_role: None,
+                    caption: None,
                     translation: None,
                 });
 
@@ -104,6 +112,10 @@ impl Workspace {
                         segment_uid: None,
                         page_idx: None,
                         segment_type: None,
+                        section_id: None,
+                        section_path: None,
+                        section_role: None,
+                        caption: None,
                         translation: None,
                     });
                 }
@@ -124,6 +136,10 @@ impl Workspace {
                         segment_uid: None,
                         page_idx: None,
                         segment_type: None,
+                        section_id: None,
+                        section_path: None,
+                        section_role: None,
+                        caption: None,
                         translation: None,
                     });
                 }
@@ -148,6 +164,10 @@ impl Workspace {
                         segment_uid: None,
                         page_idx: None,
                         segment_type: None,
+                        section_id: None,
+                        section_path: None,
+                        section_role: None,
+                        caption: None,
                         translation: None,
                     });
                     if !note.markdown.trim().is_empty() {
@@ -166,6 +186,10 @@ impl Workspace {
                             segment_uid: None,
                             page_idx: None,
                             segment_type: None,
+                            section_id: None,
+                            section_path: None,
+                            section_role: None,
+                            caption: None,
                             translation: None,
                         });
                     }
@@ -207,6 +231,10 @@ impl Workspace {
                         segment_uid: Some(note.segment_uid),
                         page_idx,
                         segment_type: segment.map(|segment| segment.segment_type),
+                        section_id: None,
+                        section_path: None,
+                        section_role: None,
+                        caption: None,
                         translation: None,
                     });
                 }
@@ -253,6 +281,10 @@ impl Workspace {
                         segment_uid: Some(annotation.segment_uid),
                         page_idx,
                         segment_type,
+                        section_id: None,
+                        section_path: None,
+                        section_role: None,
+                        caption: None,
                         translation: None,
                     });
                 }
@@ -261,6 +293,8 @@ impl Workspace {
             let parse_status = entry.pdf.as_ref().map(|pdf| pdf.parse.status);
             if options.include_segments && parse_status == Some(PdfParseStatus::Succeeded) {
                 let segments = self.read_segments(&entry.id)?;
+                let outline = neuink_domain::build_document_outline(&segments);
+                let entry_translation = self.read_entry_translation(&entry.id)?;
                 let captions_by_visual_group = segments
                     .iter()
                     .filter_map(|segment| {
@@ -320,14 +354,24 @@ impl Workspace {
                         tag_id: None,
                         tag_path: None,
                         note_id: None,
-                        segment_uid: Some(segment_uid),
+                        segment_uid: Some(segment_uid.clone()),
                         page_idx: Some(page_idx),
                         segment_type: Some(segment_type),
+                        section_id: outline
+                            .section_for_segment(&segment_uid)
+                            .map(|section| section.section_id.clone()),
+                        section_path: outline
+                            .section_for_segment(&segment_uid)
+                            .map(|section| section.section_path.clone()),
+                        section_role: outline
+                            .section_for_segment(&segment_uid)
+                            .map(|section| section.section_role),
+                        caption: None,
                         translation: None,
                     });
                 }
 
-                for segment in segments {
+                for segment in &segments {
                     if !is_indexable_segment_type(segment.segment_type) {
                         continue;
                     }
@@ -358,8 +402,22 @@ impl Workspace {
                         segment_uid: Some(segment.uid.clone()),
                         page_idx: Some(segment.page_idx),
                         segment_type: Some(segment.segment_type),
+                        section_id: outline
+                            .section_for_segment(&segment.uid)
+                            .map(|section| section.section_id.clone()),
+                        section_path: outline
+                            .section_for_segment(&segment.uid)
+                            .map(|section| section.section_path.clone()),
+                        section_role: outline
+                            .section_for_segment(&segment.uid)
+                            .map(|section| section.section_role),
+                        caption: segment
+                            .visual_group_id
+                            .as_ref()
+                            .and_then(|group| captions_by_visual_group.get(group).cloned()),
                         translation: translation_for_segment(
                             &paragraph_translations,
+                            entry_translation.as_ref(),
                             &segment.uid,
                         ),
                     });
@@ -380,11 +438,39 @@ fn structured_markdown_note_text(entry_title: &str, note_title: &str, markdown: 
 
 fn translation_for_segment(
     translations: &BTreeMap<String, crate::paragraph_translation::ParagraphTranslation>,
+    entry_translation: Option<&crate::EntryTranslation>,
     segment_uid: &SegmentUid,
 ) -> Option<String> {
-    translations
-        .get(segment_uid.as_str())
-        .and_then(|record| record.paragraph.value.as_ref())
+    let paragraph = translations.get(segment_uid.as_str());
+    let from_paragraph = paragraph
+        .and_then(|record| record.paragraph.value.clone())
+        .or_else(|| {
+            paragraph.and_then(|record| {
+                let joined = record
+                    .sentences
+                    .value
+                    .as_ref()?
+                    .iter()
+                    .map(|sentence| sentence.translation.trim())
+                    .filter(|text| !text.is_empty())
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                (!joined.is_empty()).then_some(joined)
+            })
+        });
+    from_paragraph
+        .or_else(|| {
+            entry_translation.and_then(|translation| {
+                translation
+                    .segments
+                    .iter()
+                    .find(|segment| {
+                        segment.segment_uid == *segment_uid
+                            && matches!(segment.status, TranslatedSegmentStatus::Translated)
+                    })
+                    .and_then(|segment| segment.translated_text.clone())
+            })
+        })
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
 }

@@ -1,4 +1,4 @@
-use neuink_domain::EntryId;
+use neuink_domain::{EntryId, SegmentType};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -10,6 +10,10 @@ pub struct SearchQuery {
     pub scope: SearchScope,
     #[serde(default)]
     pub include: SearchInclude,
+    #[serde(default)]
+    pub section_filter: Option<String>,
+    #[serde(default)]
+    pub segment_types: Vec<SegmentType>,
     #[serde(default = "default_limit")]
     pub limit: usize,
 }
@@ -21,6 +25,8 @@ impl SearchQuery {
             mode: SearchMode::Keyword,
             scope: SearchScope::default(),
             include: SearchInclude::default(),
+            section_filter: None,
+            segment_types: Vec::new(),
             limit: default_limit(),
         }
     }

@@ -18,6 +18,7 @@ import type {
 } from '@/shared/ipc/assistantApi';
 import {
   conversationSourceKey,
+  getEntryOutlineTool,
   loadPrompt
 } from '@/shared/ipc/assistantApi';
 import { readNote } from '@/shared/ipc/workspaceApi';
@@ -151,6 +152,18 @@ export async function answerWithGroundedAgent({
   });
   const selectedContextEntries = buildSelectedContextEntryNote(assistantContext);
   const hasExplicitContext = (assistantContext?.items ?? []).length > 0;
+  const singleEntryId = scope.entry_ids.length === 1
+    ? scope.entry_ids[0]
+    : (!hasExplicitContext ? currentEntry?.id ?? null : null);
+  let compactOutline = '';
+  if (singleEntryId) {
+    try {
+      const outline = await getEntryOutlineTool({ root, entryId: singleEntryId });
+      compactOutline = outline.compact_summary?.trim() ?? '';
+    } catch {
+      // Outline is an optional context hint; retrieval tools remain available.
+    }
+  }
   const ledger = new SourceLedger(new Map(execution?.get<Array<[number, ConversationSourceLink]>>('sources') ?? [...pinned.sourceByMarker, ...selectedNotes.sourceByMarker]));
   const runtime = await createAssistantTools({
     execution,
@@ -235,7 +248,7 @@ export async function answerWithGroundedAgent({
   const prompt = renderQnaUserPrompt(userPromptTemplate, {
     currentNote: buildCurrentNoteContext(contextSnapshot),
     documentContext:
-      [selectedNotes.text, selectedContextEntries].filter(Boolean).join('\n\n') ||
+      [selectedNotes.text, selectedContextEntries, compactOutline ? `Document outline:\n${compactOutline}` : ''].filter(Boolean).join('\n\n') ||
       (browserTabTarget ? 'A browser tab is the frozen reading target. Its body is not in context; use read_browser_tab if available and relevant.' : noExplicitContextGuidance(hasExplicitContext)),
     harnessBrief: harnessBrief || 'No harness brief was prepared.',
     pinnedContext: pinned.text || 'None',

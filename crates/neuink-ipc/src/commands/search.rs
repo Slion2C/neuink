@@ -9,7 +9,7 @@ use std::{
 };
 use rayon::prelude::*;
 
-use neuink_domain::EntryId;
+use neuink_domain::{CanonicalSectionRole, EntryId, SegmentType};
 use neuink_search::{
     semantic_index_path, semantic_result_mode, EmbeddingProvider, FastEmbedProvider,
     MemorySearchIndex, PersistentSemanticSearchIndex, SearchDocument, SearchDocumentSource,
@@ -30,12 +30,20 @@ const EMBEDDING_PROVIDER_CACHE_LIMIT: usize = 1;
 const CACHE_TTL: Duration = Duration::from_secs(60 * 30);
 const CACHE_CLEANUP_INTERVAL: Duration = Duration::from_secs(60 * 5);
 const DISK_VECTOR_CACHE_TTL: Duration = Duration::from_secs(60 * 60 * 24 * 14);
-const SEMANTIC_INDEX_FORMAT_VERSION: u32 = 4;
+const SEMANTIC_INDEX_FORMAT_VERSION: u32 = 5;
 
 #[derive(Debug, Deserialize)]
 pub struct SearchEntriesRequest {
     pub root: PathBuf,
     pub query: String,
+    #[serde(default)]
+    pub english_query: Option<String>,
+    #[serde(default)]
+    pub sub_queries: Vec<String>,
+    #[serde(default)]
+    pub section_filter: Option<String>,
+    #[serde(default)]
+    pub segment_types: Vec<String>,
     #[serde(default)]
     pub scope_entry_ids: Vec<EntryId>,
     #[serde(default)]
@@ -52,6 +60,10 @@ pub struct SearchSegmentsRequest {
     pub english_query: Option<String>,
     #[serde(default)]
     pub sub_queries: Vec<String>,
+    #[serde(default)]
+    pub section_filter: Option<String>,
+    #[serde(default)]
+    pub segment_types: Vec<String>,
     #[serde(default)]
     pub scope_entry_ids: Vec<EntryId>,
     #[serde(default)]
@@ -174,16 +186,61 @@ pub async fn search_entries<R: tauri::Runtime>(
 ) -> Result<SearchResults, String> {
     let embedding_model_dir = embedding_model_dir(&app)?;
     tokio::task::spawn_blocking(move || {
-        run_search(
-            embedding_model_dir,
-            request.root,
-            request.query,
-            request.scope_entry_ids,
-            request.mode,
-            request.limit.unwrap_or(40),
-            WorkspaceSearchOptions::default(),
-            SearchInclude::default(),
-        )
+        let primary_query = request.query.trim().to_string();
+        if primary_query.is_empty() {
+            return Err("query is required".to_string());
+        }
+        let mut queries = vec![(primary_query.clone(), 1.0_f32)];
+        if let Some(english_query) = request
+            .english_query
+            .as_deref()
+            .map(str::trim)
+            .filter(|query| !query.is_empty())
+        {
+            queries.push((english_query.to_string(), 0.9));
+        }
+        for sub_query in request
+            .sub_queries
+            .into_iter()
+            .map(|query| query.trim().to_string())
+            .filter(|query| !query.is_empty())
+            .take(3)
+        {
+            queries.push((sub_query, 0.75));
+        }
+        let scope_entry_ids = request.scope_entry_ids;
+        let section_filter = request.section_filter.clone();
+        let segment_types = parse_segment_types(&request.segment_types);
+        let search_results = queries
+            .par_iter()
+            .map(|(query, _)| {
+                run_search(
+                    embedding_model_dir.clone(),
+                    request.root.clone(),
+                    query.clone(),
+                    scope_entry_ids.clone(),
+                    request.mode,
+                    request.limit.unwrap_or(40),
+                    WorkspaceSearchOptions::default(),
+                    SearchInclude::default(),
+                    section_filter.clone(),
+                    segment_types.clone(),
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let weights = queries.iter().map(|(_, weight)| *weight).collect::<Vec<_>>();
+        let mut results = merge_query_results(primary_query, search_results, &weights);
+        rerank_section_hits(&mut results, section_filter.as_deref());
+        if contains_cjk(&results.query)
+            && request.english_query.as_deref().is_none_or(|query| query.trim().is_empty())
+            && (results.mode.contains("fallback") || results.total_hit_count == 0)
+        {
+            results.warnings.push(
+                "中文查询未提供 english_query；若目标是英文论文，当前结果可能缺少跨语种匹配。"
+                    .to_string(),
+            );
+        }
+        Ok(results)
     })
     .await
     .map_err(|error| error.to_string())?
@@ -223,6 +280,8 @@ pub async fn search_segments<R: tauri::Runtime>(
         queries.push((sub_query, 0.75));
     }
     let scope_entry_ids = request.scope_entry_ids;
+    let section_filter = request.section_filter.clone();
+    let segment_types = parse_segment_types(&request.segment_types);
     let mode = request.mode;
     let has_english_query = queries.len() > 1;
     tokio::task::spawn_blocking(move || {
@@ -238,6 +297,8 @@ pub async fn search_segments<R: tauri::Runtime>(
                     candidate_k,
                     options.clone(),
                     include.clone(),
+                    section_filter.clone(),
+                    segment_types.clone(),
                 )
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -245,7 +306,7 @@ pub async fn search_segments<R: tauri::Runtime>(
         let mut results = merge_query_results(primary_query, search_results, &weights);
         if contains_cjk(&results.query)
             && !has_english_query
-            && results.mode.contains("fallback")
+            && (results.mode.contains("fallback") || results.total_hit_count == 0)
         {
             results.warnings.push(
                 "中文查询未提供 english_query，且语义索引不可用；英文论文可能没有关键词交集，请配置模型或同时提供英文检索词。"
@@ -260,6 +321,24 @@ pub async fn search_segments<R: tauri::Runtime>(
 
 fn contains_cjk(text: &str) -> bool {
     text.chars().any(|ch| matches!(ch, '\u{3400}'..='\u{4dbf}' | '\u{4e00}'..='\u{9fff}'))
+}
+
+fn parse_segment_types(values: &[String]) -> Vec<SegmentType> {
+    values
+        .iter()
+        .filter_map(|value| match value.trim().to_ascii_lowercase().as_str() {
+            "paragraph" => Some(SegmentType::Paragraph),
+            "heading" => Some(SegmentType::Heading),
+            "table" => Some(SegmentType::Table),
+            "figure" => Some(SegmentType::Figure),
+            "math" | "equation" => Some(SegmentType::Math),
+            "code" => Some(SegmentType::Code),
+            "list" => Some(SegmentType::List),
+            "aside_text" | "aside" => Some(SegmentType::AsideText),
+            "page_footnote" | "footnote" => Some(SegmentType::PageFootnote),
+            _ => None,
+        })
+        .collect()
 }
 
 fn merge_query_results(
@@ -425,6 +504,8 @@ fn run_search(
     limit: usize,
     options: WorkspaceSearchOptions,
     include: SearchInclude,
+    section_filter: Option<String>,
+    segment_types: Vec<SegmentType>,
 ) -> Result<SearchResults, String> {
     let workspace = Workspace::open(&root).map_err(|error| error.to_string())?;
     clean_disk_vector_cache(&root);
@@ -437,6 +518,7 @@ fn run_search(
         .filter_map(search_document)
         .collect::<Vec<_>>();
     let records_fingerprint = records_fingerprint(&records);
+    let semantic_fingerprint = semantic_records_fingerprint(&records);
     let index = cached_index(&root, &options, records_fingerprint, documents.clone())?;
     let search_query = SearchQuery {
         text: query,
@@ -445,6 +527,8 @@ fn run_search(
             entry_ids: scope_entry_ids,
         },
         include,
+        section_filter,
+        segment_types,
         limit,
     };
 
@@ -460,7 +544,7 @@ fn run_search(
         &documents,
         &root,
         &options,
-        records_fingerprint,
+        semantic_fingerprint,
         search_query.clone(),
     ) {
         Ok(results) => Ok(results),
@@ -486,6 +570,7 @@ fn get_search_index_status_impl(
         .filter(|document| search_include_contains(&include, document.source.kind))
         .count();
     let records_fingerprint = records_fingerprint(&records);
+    let semantic_fingerprint = semantic_records_fingerprint(&records);
     let keyword_cache_key = workspace_cache_key(&request.root, &options);
     let keyword_memory_cache_ready = SEARCH_INDEX_CACHE
         .get_or_init(|| Mutex::new(HashMap::new()))
@@ -506,7 +591,7 @@ fn get_search_index_status_impl(
         .and_then(|cache| {
             cache
                 .get(&semantic_cache_key)
-                .map(|cached| cached.fingerprint == records_fingerprint)
+                .map(|cached| cached.fingerprint == semantic_fingerprint)
         })
         .unwrap_or(false);
 
@@ -516,7 +601,7 @@ fn get_search_index_status_impl(
     let disk_cache = read_semantic_disk_cache_status(&semantic_disk_cache_path);
     let semantic_disk_cache_ready = disk_cache
         .as_ref()
-        .is_some_and(|status| status.current_for(records_fingerprint));
+        .is_some_and(|status| status.current_for(semantic_fingerprint));
     let semantic_disk_cache_modified_at_ms = semantic_disk_cache_path
         .metadata()
         .ok()
@@ -583,6 +668,7 @@ fn rebuild_search_index_impl(
         }
 
         let records_fingerprint = records_fingerprint(&records);
+        let semantic_fingerprint = semantic_records_fingerprint(&records);
         let keyword_index = cached_index(
             &request.root,
             &options,
@@ -593,7 +679,7 @@ fn rebuild_search_index_impl(
         let _ = cached_semantic_index(
             &request.root,
             &options,
-            records_fingerprint,
+            semantic_fingerprint,
             &include,
             &documents,
             provider.clone(),
@@ -1393,12 +1479,22 @@ fn search_document(record: WorkspaceSearchRecord) -> Option<SearchDocument> {
             note_id: record.note_id,
             segment_uid: record.segment_uid,
             page_idx: record.page_idx,
-            ..Default::default()
+            section_id: record.section_id.clone(),
+            section_path: record.section_path.clone(),
+            section_role: record.section_role,
+            segment_type: record.segment_type,
         },
         target,
         title: record.title,
         sections: {
-            let mut sections = vec![title_section, SearchTextSection::body(record.text)];
+            let mut sections = vec![title_section];
+            if let Some(path) = record.section_path.clone().filter(|path| !path.trim().is_empty()) {
+                sections.push(SearchTextSection::with_boost("section_path", path, 1.6));
+            }
+            if let Some(caption) = record.caption.clone().filter(|caption| !caption.trim().is_empty()) {
+                sections.push(SearchTextSection::with_boost("caption", caption, 1.8));
+            }
+            sections.push(SearchTextSection::body(record.text));
             if let Some(translation) = record.translation {
                 sections.push(SearchTextSection::with_boost(
                     "translation",
@@ -1408,7 +1504,12 @@ fn search_document(record: WorkspaceSearchRecord) -> Option<SearchDocument> {
             }
             sections
         },
-        boost: source_boost(record.kind),
+        boost: source_boost(record.kind)
+            * if record.section_role == Some(CanonicalSectionRole::References) {
+                0.35
+            } else {
+                1.0
+            },
     })
 }
 
@@ -1454,6 +1555,50 @@ fn filter_segment_search_results(mut results: SearchResults, limit: usize) -> Se
     results.entries = entries;
     results.total_hit_count = results.entries.iter().map(|entry| entry.hit_count).sum();
     results
+}
+
+fn rerank_section_hits(results: &mut SearchResults, section_filter: Option<&str>) {
+    let plan = neuink_search::infer_query_plan(&results.query);
+    let filter_mentions_references = section_filter
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+        .contains("reference");
+    for hit in results.entries.iter_mut().flat_map(|entry| entry.hits.iter_mut()) {
+        let role_bonus = plan
+            .section_role
+            .zip(hit.source.section_role)
+            .map(|(expected, actual)| if expected == actual { 1.15 } else { 1.0 })
+            .unwrap_or(1.0);
+        let modality_bonus = match (plan.modality, hit.source.segment_type) {
+            (neuink_search::QueryModality::Table, Some(SegmentType::Table))
+            | (neuink_search::QueryModality::Figure, Some(SegmentType::Figure))
+            | (neuink_search::QueryModality::Math, Some(SegmentType::Math)) => 1.15,
+            _ => 1.0,
+        };
+        let reference_penalty = if hit.source.section_role == Some(CanonicalSectionRole::References)
+            && !filter_mentions_references
+        {
+            0.35
+        } else {
+            1.0
+        };
+        hit.score *= role_bonus * modality_bonus * reference_penalty;
+    }
+    for entry in &mut results.entries {
+        entry.hits.sort_by(|left, right| {
+            right
+                .score
+                .partial_cmp(&left.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        entry.max_score = entry.hits.first().map(|hit| hit.score).unwrap_or(0.0);
+    }
+    results.entries.sort_by(|left, right| {
+        right
+            .max_score
+            .partial_cmp(&left.max_score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
 }
 
 fn source_kind(kind: WorkspaceSearchRecordKind) -> SearchDocumentSourceKind {
@@ -1613,6 +1758,17 @@ fn semantic_cache_namespace(
 }
 
 fn records_fingerprint(records: &[WorkspaceSearchRecord]) -> u64 {
+    records_fingerprint_with_translation(records, true)
+}
+
+fn semantic_records_fingerprint(records: &[WorkspaceSearchRecord]) -> u64 {
+    records_fingerprint_with_translation(records, false)
+}
+
+fn records_fingerprint_with_translation(
+    records: &[WorkspaceSearchRecord],
+    include_translation: bool,
+) -> u64 {
     let mut hasher = DefaultHasher::new();
     records.len().hash(&mut hasher);
     let mut record_fingerprints = Vec::with_capacity(records.len());
@@ -1630,7 +1786,13 @@ fn records_fingerprint(records: &[WorkspaceSearchRecord]) -> u64 {
         record.segment_uid.hash(&mut record_hasher);
         record.page_idx.hash(&mut record_hasher);
         record.segment_type.hash(&mut record_hasher);
-        record.translation.hash(&mut record_hasher);
+        record.section_id.hash(&mut record_hasher);
+        record.section_path.hash(&mut record_hasher);
+        record.section_role.hash(&mut record_hasher);
+        record.caption.hash(&mut record_hasher);
+        if include_translation {
+            record.translation.hash(&mut record_hasher);
+        }
         record_fingerprints.push(record_hasher.finish());
     }
     record_fingerprints.sort_unstable();
@@ -1883,6 +2045,10 @@ mod tests {
             segment_uid: None,
             page_idx: None,
             segment_type: None,
+            section_id: None,
+            section_path: None,
+            section_role: None,
+            caption: None,
             translation: None,
         }
     }

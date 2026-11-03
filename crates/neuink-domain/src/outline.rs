@@ -49,6 +49,14 @@ pub struct DocumentSectionNode {
     pub level: u8,
     pub section_path: String,
     pub section_role: CanonicalSectionRole,
+    #[serde(default)]
+    pub start_page_idx: u32,
+    #[serde(default)]
+    pub end_page_idx: u32,
+    #[serde(default)]
+    pub table_count: usize,
+    #[serde(default)]
+    pub figure_count: usize,
     pub heading_segment_uid: Option<SegmentUid>,
     pub segment_uids: Vec<SegmentUid>,
     pub children: Vec<DocumentSectionNode>,
@@ -93,6 +101,27 @@ impl DocumentOutline {
         visit(&self.sections, &mut out);
         out
     }
+
+    /// A bounded outline suitable for injecting into an assistant context.
+    pub fn compact_summary(&self, max_chars: usize) -> String {
+        let mut output = String::new();
+        for node in self.flatten() {
+            let line = format!(
+                "{}{} [{}-{}]{}{}\n",
+                "  ".repeat(node.level.saturating_sub(1) as usize),
+                node.title,
+                node.start_page_idx + 1,
+                node.end_page_idx + 1,
+                if node.table_count > 0 { format!(" tables={}", node.table_count) } else { String::new() },
+                if node.figure_count > 0 { format!(" figures={}", node.figure_count) } else { String::new() },
+            );
+            if output.len() + line.len() > max_chars {
+                break;
+            }
+            output.push_str(&line);
+        }
+        output.trim_end().to_string()
+    }
 }
 
 /// Build a deterministic section tree from parser output. The function uses
@@ -131,8 +160,14 @@ pub fn build_document_outline(segments: &[SourceSegment]) -> DocumentOutline {
             continue;
         }
         let segment = &segments[index];
-        let mut level =
-            heading_level(segment).unwrap_or_else(|| inferred_numbering_level(&segment.text));
+        // Parser metadata is often flattened to level=1. An explicit section
+        // number is a stronger signal and must win in that case.
+        let inferred_level = inferred_numbering_level(&segment.text);
+        let mut level = if inferred_level > 1 {
+            inferred_level
+        } else {
+            heading_level(segment).unwrap_or(1)
+        };
         level = level.clamp(1, 8);
         while let Some(&(parent_level, _)) = stack.last() {
             if parent_level < level {
@@ -143,7 +178,14 @@ pub fn build_document_outline(segments: &[SourceSegment]) -> DocumentOutline {
             }
             stack.pop();
         }
-        let role = canonical_section_role(&segment.text);
+        let parent_role = stack
+            .last()
+            .and_then(|(_, path)| node_at_path(&roots, path))
+            .map(|node| node.section_role);
+        let role = match canonical_section_role(&segment.text) {
+            CanonicalSectionRole::Other => parent_role.unwrap_or(CanonicalSectionRole::Other),
+            role => role,
+        };
         let title = compact_title(&segment.text);
         let parent_path = stack
             .last()
@@ -160,6 +202,10 @@ pub fn build_document_outline(segments: &[SourceSegment]) -> DocumentOutline {
             level,
             section_path,
             section_role: role,
+            start_page_idx: segment.page_idx,
+            end_page_idx: segment.page_idx,
+            table_count: 0,
+            figure_count: 0,
             heading_segment_uid: Some(segment.uid.clone()),
             segment_uids: vec![segment.uid.clone()],
             children: Vec::new(),
@@ -224,6 +270,16 @@ pub fn build_document_outline(segments: &[SourceSegment]) -> DocumentOutline {
             level: 1,
             section_path: "Front matter".to_string(),
             section_role: CanonicalSectionRole::FrontMatter,
+            start_page_idx: preface.first().map(|segment| segment.page_idx).unwrap_or(0),
+            end_page_idx: preface.last().map(|segment| segment.page_idx).unwrap_or(0),
+            table_count: preface
+                .iter()
+                .filter(|segment| segment.segment_type == SegmentType::Table)
+                .count(),
+            figure_count: preface
+                .iter()
+                .filter(|segment| segment.segment_type == SegmentType::Figure)
+                .count(),
             heading_segment_uid: None,
             segment_uids: preface.iter().map(|segment| segment.uid.clone()).collect(),
             children: Vec::new(),
@@ -235,6 +291,31 @@ pub fn build_document_outline(segments: &[SourceSegment]) -> DocumentOutline {
                 .insert(segment.uid.clone(), "section-front-matter".to_string());
         }
     }
+    // Derive stable page and visual counts from the assigned segment IDs.
+    fn populate_stats(
+        nodes: &mut [DocumentSectionNode],
+        segments_by_uid: &BTreeMap<SegmentUid, &SourceSegment>,
+    ) {
+        for node in nodes {
+            let assigned = node
+                .segment_uids
+                .iter()
+                .filter_map(|uid| segments_by_uid.get(uid).copied())
+                .collect::<Vec<_>>();
+            if let Some(first) = assigned.first() {
+                node.start_page_idx = assigned.iter().map(|segment| segment.page_idx).min().unwrap_or(first.page_idx);
+                node.end_page_idx = assigned.iter().map(|segment| segment.page_idx).max().unwrap_or(first.page_idx);
+                node.table_count = assigned.iter().filter(|segment| segment.segment_type == SegmentType::Table).count();
+                node.figure_count = assigned.iter().filter(|segment| segment.segment_type == SegmentType::Figure).count();
+            }
+            populate_stats(&mut node.children, segments_by_uid);
+        }
+    }
+    let segments_by_uid = segments
+        .iter()
+        .map(|segment| (segment.uid.clone(), segment))
+        .collect::<BTreeMap<_, _>>();
+    populate_stats(&mut outline.sections, &segments_by_uid);
     outline
 }
 
@@ -291,7 +372,12 @@ fn has_number_prefix(title: &str) -> bool {
 }
 
 fn canonical_section_role(title: &str) -> CanonicalSectionRole {
-    let normalized = title.to_ascii_lowercase();
+    let normalized_title = title
+        .split_whitespace()
+        .skip_while(|word| has_number_prefix(word))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let normalized = normalized_title.to_ascii_lowercase();
     let normalized = normalized.trim_matches(|ch: char| !ch.is_ascii_alphanumeric());
     if normalized.starts_with("abstract") {
         CanonicalSectionRole::Abstract
@@ -387,8 +473,22 @@ mod tests {
             vec![1, 2]
         );
         assert!(outline.section_for_segment(&body.uid).is_some());
+        assert!(outline.compact_summary(500).contains("Introduction"));
         body.text.clear();
         segments[3] = body;
+    }
+
+    #[test]
+    fn numbered_headings_override_flat_parser_levels_and_inherit_role() {
+        let headings = vec![
+            heading("4 Experiments", Some("1")),
+            heading("4.2 Ablation Study", Some("1")),
+        ];
+        let outline = build_document_outline(&headings);
+        let nodes = outline.flatten();
+        assert_eq!(nodes[0].level, 1);
+        assert_eq!(nodes[1].level, 2);
+        assert_eq!(nodes[1].section_role, CanonicalSectionRole::Experiments);
     }
 
     #[test]

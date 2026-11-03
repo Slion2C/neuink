@@ -66,6 +66,10 @@ export type SearchDocumentSource = {
   note_id: NoteId | null;
   segment_uid: string | null;
   page_idx: number | null;
+  section_id?: string | null;
+  section_path?: string | null;
+  section_role?: string | null;
+  segment_type?: string | null;
 };
 
 export type SearchHit = {
@@ -1177,6 +1181,10 @@ export async function searchEntries(
     limit?: number;
     mode?: SearchMode;
     scopeEntryIds?: EntryId[];
+    englishQuery?: string;
+    subQueries?: string[];
+    sectionFilter?: string;
+    segmentTypes?: string[];
   } = {}
 ): Promise<SearchResults> {
   return invoke<SearchResults>('search_entries', {
@@ -1185,7 +1193,11 @@ export async function searchEntries(
       query,
       limit: options.limit ?? null,
       mode: options.mode ?? 'keyword',
-      scope_entry_ids: options.scopeEntryIds ?? []
+      scope_entry_ids: options.scopeEntryIds ?? [],
+      english_query: options.englishQuery ?? null,
+      sub_queries: options.subQueries ?? [],
+      section_filter: options.sectionFilter ?? null,
+      segment_types: options.segmentTypes ?? []
     }
   });
 }
@@ -1199,6 +1211,8 @@ export async function searchSegments(
     scopeEntryIds?: EntryId[];
     englishQuery?: string;
     subQueries?: string[];
+    sectionFilter?: string;
+    segmentTypes?: string[];
   } = {}
 ): Promise<SearchResults> {
   return invoke<SearchResults>('search_segments', {
@@ -1209,7 +1223,9 @@ export async function searchSegments(
       mode: options.mode ?? 'keyword',
       scope_entry_ids: options.scopeEntryIds ?? [],
       english_query: options.englishQuery ?? null,
-      sub_queries: options.subQueries ?? []
+      sub_queries: options.subQueries ?? [],
+      section_filter: options.sectionFilter ?? null,
+      segment_types: options.segmentTypes ?? []
     }
   });
 }

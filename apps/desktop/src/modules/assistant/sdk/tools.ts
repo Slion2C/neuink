@@ -98,6 +98,7 @@ const SUPPORTED_TOOL_NAMES = new Set([
   'search_segments',
   'read_segment_content',
   'read_entry_assistant_context',
+  'get_entry_outline',
   'search_sciverse_evidence',
   'read_sciverse_content',
   'search_sciverse_metadata',

@@ -182,6 +182,7 @@ impl SearchSnapshot {
                 let indexed = self.documents.get(doc_idx)?;
                 if !query.scope.contains_entry(&indexed.document.entry_id)
                     || !included_by_query(&query.include, indexed.document.source.kind)
+                    || !matches_section_filter(&query, &indexed.document)
                 {
                     return None;
                 }
@@ -333,6 +334,30 @@ fn included_by_query(include: &SearchInclude, kind: SearchDocumentSourceKind) ->
     }
 }
 
+fn matches_section_filter(query: &SearchQuery, document: &SearchDocument) -> bool {
+    if let Some(filter) = query.section_filter.as_deref().map(str::trim).filter(|value| !value.is_empty()) {
+        let filter_lower = filter.to_ascii_lowercase();
+        let section_match = document
+            .source
+            .section_id
+            .as_deref()
+            .is_some_and(|id| id == filter)
+            || document
+                .source
+                .section_path
+                .as_deref()
+                .is_some_and(|path| path.to_ascii_lowercase().contains(&filter_lower));
+        if !section_match {
+            return false;
+        }
+    }
+    query.segment_types.is_empty()
+        || document
+            .source
+            .segment_type
+            .is_some_and(|segment_type| query.segment_types.contains(&segment_type))
+}
+
 fn compare_hits(left: &SearchHit, right: &SearchHit) -> Ordering {
     right
         .score
@@ -371,13 +396,15 @@ fn cache_key(query: &SearchQuery, normalized_query: &str) -> String {
         .collect::<Vec<_>>();
     scope.sort();
     format!(
-        "{}|{:?}|{}|{}:{}:{}|{}",
+        "{}|{:?}|{}|{}:{}:{}|{}|{:?}|{}",
         normalized_query,
         query.mode,
         query.limit,
         query.include.entry_meta,
         query.include.notes,
         query.include.segments,
+        query.section_filter.as_deref().unwrap_or_default(),
+        query.segment_types,
         scope.join(",")
     )
 }
