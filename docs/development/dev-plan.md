@@ -1,5 +1,10 @@
 # Neuink 开发计划
 
+### 2026-11-04：统一检索工具规划与 BM25 初步诊断
+
+- 新增[统一检索工具补全计划](retrieval-tool-completion-plan.md)，说明问题分析、范围解析、论文级与片段级候选召回及按需补查的待实施设计。
+- 新增[章节感知 BM25 初步诊断](section-aware-bm25-diagnostic.md)。当前仅完成小样本关键词离线对照；标注尚未人工确认，章节权重候选未在独立留出集、混合检索或原生助手入口验收，不改变生产排序。
+
 ### 2026-11-03：BookRAG Lite 检索实施记录（生产默认保持 Legacy，章节重排关闭）
 
 - 共享检索入口位于 `crates/neuink-search/src/retrieval_pipeline.rs`（`recall_candidates`、`fuse_query_candidates`、`finalize_candidates`）。IPC 与 bench 共用同一路径。候选窗口为 `max(5K, 60)`，K 截到 200。过滤先于截断，最终 K 只截断一次。
