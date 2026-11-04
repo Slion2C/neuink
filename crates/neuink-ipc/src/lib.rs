@@ -154,6 +154,7 @@ pub fn register_commands<R: tauri::Runtime>(builder: tauri::Builder<R>) -> tauri
             commands::search::rebuild_search_index,
             commands::search::search_entries,
             commands::search::search_segments,
+            commands::search::search_segments_batch,
             commands::tag::create_tag,
             commands::tag::delete_tag,
             commands::tag::rename_tag,

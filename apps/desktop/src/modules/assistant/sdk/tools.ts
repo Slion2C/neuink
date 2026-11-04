@@ -5,7 +5,7 @@ import { assertResearchRetry } from './researchRecovery';
 import { buildDiagramArtifact } from './diagramArtifact';
 import { createBrowserTabTool } from './browserTabTool';
 import type { BrowserTabTarget } from '@/shared/ipc/browserApi';
-import { safeToolErrorEvent, toolPreflight, trackToolFailures, ToolPreconditionError } from './toolFailurePolicy';
+import { assertSuccessfulToolResult, safeToolErrorEvent, toolPreflight, trackToolFailures, ToolPreconditionError } from './toolFailurePolicy';
 import { createAgentToolFailure, isAgentToolFailure } from '../agent-core/toolFailure';
 import { AgentLocalLimitError, AgentStoppedError } from '../agent-core/agent';
 
@@ -34,16 +34,18 @@ import type {
   AssistantTagProposal,
   AssistantTaskPlan
 } from '@/shared/types/assistant';
-import { readNote } from '@/shared/ipc/workspaceApi';
+import { readNote, type SearchResults } from '@/shared/ipc/workspaceApi';
 
 import {
   asObject,
   assertModelToolNameAvailable,
   assertValidModelToolNames,
   buildNoteProposal,
+  clampTopK,
   entryIdOrSingleScope,
   errorMessage,
   executeTool,
+  formatSearchSegmentsOutput,
   mcpToolIdsForAgent,
   modelInputSchema,
   modelToolName,
@@ -83,7 +85,9 @@ import { stableHash } from '../runtime/evidenceLedger';
 import { RunBudget, type AgentLoopGuard } from '../agent-core';
 import { SourceLedger } from '../runtime/sourceLedger';
 import type { ApplicationActions } from '../runtime/applicationActions';
-import { resolveModelProfile } from './modelTasks';
+import { resolveModelProfile, runJsonModelTask } from './modelTasks';
+import { PLANNER_TASK_DESCRIPTION, PLANNER_TASK_NAME, fallbackDirectPlan, planRetrieval, type PlanResolution } from './retrievalPlanning';
+import { runSearchLibrary } from './searchLibrary';
 import { PLANNING_READ_TOOLS } from '../runtime/executionPolicy';
 import { buildEntryMetaProposal } from './entryMetaProposal';
 import {
@@ -96,6 +100,7 @@ const SUPPORTED_TOOL_NAMES = new Set([
   ...PDF_TOOL_NAMES,
   'search_papers', 'search_web', 'read_webpage', 'import_papers',
   'search_segments',
+  'search_library',
   'read_segment_content',
   'read_entry_assistant_context',
   'get_entry_outline',
@@ -640,12 +645,115 @@ export async function createAssistantTools({
     }) as ToolSet[string];
   }
 
+  if (enabledToolIds.has('search_library')) {
+    const planSearch = async (question: string, scopeHint: string): Promise<PlanResolution> => {
+      let profile: LlmProfile;
+      try {
+        profile = resolveModelProfile(null, profiles, defaultProfile);
+      } catch {
+        return fallbackDirectPlan(question, 'no_model_configured');
+      }
+      const runModel = async (system: string, prompt: string) =>
+        runJsonModelTask({
+          budget,
+          abortSignal,
+          settings: profile,
+          name: PLANNER_TASK_NAME,
+          description: PLANNER_TASK_DESCRIPTION,
+          system,
+          prompt
+        });
+      return planRetrieval({ question, scopeHint, runModel });
+    };
+
+    tools.search_library = tool<unknown, unknown>({
+      description:
+        'Search the library for evidence answering a question. With use_planning true, decompose multi-target or cross-paper questions and report per-sub-question coverage; otherwise retrieve the original question directly. Returns evidence grouped by sub-question plus coverage and any planning degradation.',
+      inputSchema: jsonSchema<unknown>({
+        type: 'object',
+        additionalProperties: false,
+        required: ['question'],
+        properties: {
+          question: { type: 'string', description: 'The question to search for.' },
+          scope_entry_ids: { type: 'array', items: { type: 'string' }, description: 'Optional Entry ids; omit for the full library or the frozen scope.' },
+          use_planning: { type: 'boolean', description: 'Optional; decompose multi-target or cross-paper questions with the configured model.' },
+          top_k: { type: 'integer', minimum: 1, maximum: 12, description: 'Optional maximum segment hits per sub-question.' }
+        }
+      } as JSONSchema7),
+      execute: async (input, options) => {
+        const toolCallId = options.toolCallId;
+        let fingerprint: string | undefined;
+        try {
+          const object = asObject(input);
+          const question = toolPreflight(() => requiredString(object.question, 'question'));
+          const scopeEntryIds = object.scope_entry_ids == null ? null : stringArray(object.scope_entry_ids);
+          const usePlanning = object.use_planning === true;
+          const topK = clampTopK(object.top_k);
+          fingerprint = loopGuard?.beforeToolCall('search_library', {
+            question,
+            scope_entry_ids: scopeEntryIds ?? [],
+            use_planning: usePlanning
+          });
+          emit({
+            id: toolCallId,
+            input: publicInput({ question, scope_entry_ids: scopeEntryIds ?? [], use_planning: usePlanning, top_k: topK }),
+            status: 'running',
+            summary: '正在检索资料库…',
+            toolName: 'search_library'
+          });
+          const result = await runSearchLibrary({
+            question,
+            scopeEntryIds,
+            usePlanning,
+            topK,
+            frozenEntryIds: scope.entry_ids,
+            plan: planSearch,
+            search: async (task, scopeIds, k) => {
+              const results = await invokeAssistantTool<SearchResults>('search_segments', {
+                root,
+                query: task.question,
+                mode: 'hybrid',
+                scope_entry_ids: scopeIds,
+                top_k: k
+              });
+              assertSuccessfulToolResult(results);
+              const formatted = formatSearchSegmentsOutput(results, addSource, null);
+              return { evidence: formatted.modelOutput.evidence, sources: formatted.sources };
+            },
+            abortSignal: options.abortSignal ?? abortSignal
+          });
+          (options.abortSignal ?? abortSignal)?.throwIfAborted();
+          observations.push({ output: result.modelOutput, toolName: 'search_library' });
+          loopGuard?.recordSuccess(result.modelOutput);
+          emit({
+            id: toolCallId,
+            input: publicInput({ question }),
+            sources: result.sources,
+            status: 'done',
+            summary: result.summary,
+            toolName: 'search_library'
+          });
+          return result.modelOutput;
+        } catch (error) {
+          if (fingerprint) loopGuard?.recordFailure(fingerprint);
+          emit({
+            error: errorMessage(error),
+            id: toolCallId,
+            input,
+            status: 'error',
+            toolName: 'search_library'
+          });
+          throw error;
+        }
+      }
+    }) as ToolSet[string];
+  }
+
   const proposalToolNames = [
     'note.propose_create',
     'note.propose_patch',
     'segment_note.propose_patch'
-  ] as const;
-  for (const toolName of proposalToolNames) {
+  ] as const;  for (const toolName of proposalToolNames) {
     if (!canPropose || !enabledToolIds.has(toolName) || !onNoteProposal) continue;
     const exposedToolName = modelToolName(toolName);
     assertModelToolNameAvailable(tools, toolName, exposedToolName);

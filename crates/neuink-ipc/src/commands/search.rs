@@ -73,6 +73,31 @@ pub struct SearchSegmentsRequest {
 }
 
 #[derive(Debug, Deserialize)]
+pub struct SearchSegmentTask {
+    pub query: String,
+    #[serde(default)]
+    pub english_query: Option<String>,
+    #[serde(default)]
+    pub sub_queries: Vec<String>,
+    #[serde(default)]
+    pub section_filter: Option<String>,
+    #[serde(default)]
+    pub segment_types: Vec<String>,
+    #[serde(default)]
+    pub scope_entry_ids: Vec<EntryId>,
+    #[serde(default)]
+    pub mode: SearchMode,
+    #[serde(default)]
+    pub top_k: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SearchSegmentsBatchRequest {
+    pub root: PathBuf,
+    pub tasks: Vec<SearchSegmentTask>,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct SearchIndexStatusRequest {
     pub root: PathBuf,
     #[serde(default)]
@@ -230,26 +255,24 @@ pub async fn search_segments<R: tauri::Runtime>(
     .map_err(|error| error.to_string())?
 }
 
-fn run_search_bundle(
+/// Resources shared by every query in one search request. Built once per
+/// `prepare_search` call; records and documents are dropped after preparation.
+struct PreparedSearch {
+    include: SearchInclude,
+    keyword: Arc<MemorySearchIndex>,
+    provider: Arc<FastEmbedProvider>,
+    semantic: Option<Arc<PersistentSemanticSearchIndex>>,
+}
+
+fn prepare_search(
     model_dir: PathBuf,
-    root: PathBuf,
-    primary: String,
-    english: Option<String>,
-    sub_queries: Vec<String>,
-    scope: Vec<EntryId>,
-    mode: SearchMode,
-    limit: usize,
+    root: &PathBuf,
     segments_only: bool,
-    section_filter: Option<String>,
-    segment_types: Vec<SegmentType>,
-) -> Result<SearchResults, String> {
-    let primary = primary.trim().to_string();
-    if primary.is_empty() {
-        return Err("query is required".into());
-    }
+    needs_semantic: bool,
+) -> Result<PreparedSearch, String> {
     let (options, include) = search_scope_options(segments_only);
-    let workspace = Workspace::open(&root).map_err(|e| e.to_string())?;
-    clean_disk_vector_cache(&root);
+    let workspace = Workspace::open(root).map_err(|e| e.to_string())?;
+    clean_disk_vector_cache(root);
     let records = workspace
         .collect_search_records(options.clone())
         .map_err(|e| e.to_string())?;
@@ -259,16 +282,16 @@ fn run_search_bundle(
         .filter_map(search_document)
         .collect::<Vec<_>>();
     let keyword = cached_index(
-        &root,
+        root,
         &options,
         records_fingerprint(&records),
         documents.clone(),
     )?;
     let provider = cached_embedding_provider(model_dir).map_err(|e| e.to_string())?;
     let semantic_fingerprint = semantic_records_fingerprint(&records);
-    let semantic = if mode != SearchMode::Keyword {
+    let semantic = if needs_semantic {
         try_cached_semantic_index(
-            &root,
+            root,
             &options,
             semantic_fingerprint,
             &include,
@@ -278,9 +301,9 @@ fn run_search_bundle(
     } else {
         None
     };
-    if mode != SearchMode::Keyword && semantic.is_none() {
+    if needs_semantic && semantic.is_none() {
         schedule_legacy_semantic_rebuild(
-            &root,
+            root,
             &options,
             semantic_fingerprint,
             &include,
@@ -288,11 +311,41 @@ fn run_search_bundle(
             provider.clone(),
         );
     }
+    Ok(PreparedSearch {
+        include,
+        keyword,
+        provider,
+        semantic,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_single_query(
+    prepared: &PreparedSearch,
+    primary: &str,
+    english: Option<&str>,
+    sub_queries: &[String],
+    scope: Vec<EntryId>,
+    mode: SearchMode,
+    limit: usize,
+    segments_only: bool,
+    section_filter: Option<String>,
+    segment_types: Vec<SegmentType>,
+) -> Result<SearchResults, String> {
+    let primary = primary.trim().to_string();
+    let keyword = prepared.keyword.as_ref();
+    let provider = prepared.provider.as_ref();
+    // A keyword query never uses the semantic index, even when a sibling task in
+    // the same batch needed it and it was prepared.
+    let semantic = prepared
+        .semantic
+        .as_deref()
+        .filter(|_| mode != SearchMode::Keyword);
     let template = SearchQuery {
         text: primary.clone(),
         mode,
         scope: SearchScope { entry_ids: scope },
-        include,
+        include: prepared.include.clone(),
         section_filter,
         segment_types,
         segments_only,
@@ -300,11 +353,11 @@ fn run_search_bundle(
         limit,
     };
     let mut queries = vec![(primary.clone(), 1.0)];
-    if let Some(q) = english.as_deref().map(str::trim).filter(|q| !q.is_empty()) {
+    if let Some(q) = english.map(str::trim).filter(|q| !q.is_empty()) {
         queries.push((q.to_string(), 0.9));
     }
     for q in sub_queries
-        .into_iter()
+        .iter()
         .map(|q| q.trim().to_string())
         .filter(|q| !q.is_empty())
         .take(3)
@@ -319,14 +372,14 @@ fn run_search_bundle(
     for (i, (text, _)) in queries.iter().enumerate() {
         let mut query = template.clone();
         query.text = text.clone();
-        let vector = if semantic.is_some() && mode != SearchMode::Keyword {
-            embed_query_vector(provider.as_ref(), text).ok()
+        let vector = if semantic.is_some() {
+            embed_query_vector(provider, text).ok()
         } else {
             None
         };
         let result = neuink_search::recall_candidates(
-            &keyword,
-            semantic.as_deref(),
+            keyword,
+            semantic,
             &query,
             vector.as_deref(),
             production_hybrid_policy(&query),
@@ -336,7 +389,7 @@ fn run_search_bundle(
             Ok(result) => result,
             Err(error) => {
                 query.limit = window;
-                keyword_fallback(&keyword, query, error)?
+                keyword_fallback(keyword, query, error)?
             }
         };
         if i == 0 {
@@ -350,7 +403,7 @@ fn run_search_bundle(
         .collect::<Vec<_>>();
     let fused = neuink_search::fuse_query_candidates(&primary, &lists, &weights);
     let chapters = if BOOKRAG_SECTION_ALPHA > 0.0 {
-        semantic.as_ref().map(|index| index.chapter_centroids())
+        semantic.map(|index| index.chapter_centroids())
     } else {
         None
     };
@@ -371,6 +424,83 @@ fn run_search_bundle(
             .push("中文查询未提供英文检索词；请检查本地向量索引，或显式开启双语扩展。".into());
     }
     Ok(result)
+}
+
+fn run_search_bundle(
+    model_dir: PathBuf,
+    root: PathBuf,
+    primary: String,
+    english: Option<String>,
+    sub_queries: Vec<String>,
+    scope: Vec<EntryId>,
+    mode: SearchMode,
+    limit: usize,
+    segments_only: bool,
+    section_filter: Option<String>,
+    segment_types: Vec<SegmentType>,
+) -> Result<SearchResults, String> {
+    let primary = primary.trim().to_string();
+    if primary.is_empty() {
+        return Err("query is required".into());
+    }
+    let prepared = prepare_search(model_dir, &root, segments_only, mode != SearchMode::Keyword)?;
+    run_single_query(
+        &prepared,
+        &primary,
+        english.as_deref(),
+        &sub_queries,
+        scope,
+        mode,
+        limit,
+        segments_only,
+        section_filter,
+        segment_types,
+    )
+}
+
+#[tauri::command]
+pub async fn search_segments_batch<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+    request: SearchSegmentsBatchRequest,
+) -> Result<Vec<SearchResults>, String> {
+    let model_dir = embedding_model_dir(&app)?;
+    tokio::task::spawn_blocking(move || run_segments_batch(model_dir, request))
+        .await
+        .map_err(|error| error.to_string())?
+}
+
+/// Prepares the workspace index and embedding provider once, then runs each
+/// task in order against those shared resources. Results follow task order.
+fn run_segments_batch(
+    model_dir: PathBuf,
+    request: SearchSegmentsBatchRequest,
+) -> Result<Vec<SearchResults>, String> {
+    let SearchSegmentsBatchRequest { root, tasks } = request;
+    if tasks.iter().any(|task| task.query.trim().is_empty()) {
+        return Err("query is required".into());
+    }
+    if tasks.is_empty() {
+        return Ok(Vec::new());
+    }
+    let needs_semantic = tasks.iter().any(|task| task.mode != SearchMode::Keyword);
+    let prepared = prepare_search(model_dir, &root, true, needs_semantic)?;
+    tasks
+        .into_iter()
+        .map(|task| {
+            run_single_query(
+                &prepared,
+                &task.query,
+                task.english_query.as_deref(),
+                &task.sub_queries,
+                task.scope_entry_ids,
+                task.mode,
+                task.top_k.unwrap_or(20).clamp(1, 20),
+                true,
+                task.section_filter,
+                parse_segment_types(&task.segment_types),
+            )
+        })
+        .collect()
 }
 
 // Updated only from the frozen selection and independent gate report.
@@ -1881,6 +2011,38 @@ mod tests {
             assert!(matches!(stored.state, SearchIndexBuildState::Idle));
             let _ = fs::remove_dir_all(root);
         }
+    }
+
+    #[test]
+    fn segments_batch_rejects_any_blank_query_before_opening_workspace() {
+        let request = super::SearchSegmentsBatchRequest {
+            root: std::path::PathBuf::from("workspace-that-does-not-exist"),
+            tasks: vec![
+                super::SearchSegmentTask {
+                    query: "valid".to_string(),
+                    english_query: None,
+                    sub_queries: Vec::new(),
+                    section_filter: None,
+                    segment_types: Vec::new(),
+                    scope_entry_ids: Vec::new(),
+                    mode: Default::default(),
+                    top_k: None,
+                },
+                super::SearchSegmentTask {
+                    query: "   ".to_string(),
+                    english_query: None,
+                    sub_queries: Vec::new(),
+                    section_filter: None,
+                    segment_types: Vec::new(),
+                    scope_entry_ids: Vec::new(),
+                    mode: Default::default(),
+                    top_k: None,
+                },
+            ],
+        };
+        let error = super::run_segments_batch(std::path::PathBuf::from("model"), request)
+            .expect_err("blank query must be rejected");
+        assert_eq!(error, "query is required");
     }
 
     fn record(entry_id: &str, text: &str) -> WorkspaceSearchRecord {
