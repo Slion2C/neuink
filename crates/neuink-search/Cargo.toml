@@ -6,6 +6,7 @@ authors.workspace = true
 license.workspace = true
 
 [dependencies]
+blake3.workspace = true
 fastembed = { workspace = true, optional = true }
 neuink-domain = { path = "../neuink-domain" }
 rayon.workspace = true

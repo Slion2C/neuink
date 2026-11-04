@@ -13,14 +13,23 @@ export type DiversityCandidate = {
   key: string;
   score: number;
   text: string;
-  /** Section identity returned by the BookRAG-aware backend. */
-  sectionPath?: string | null;
+  /**
+   * Entry-qualified section identity (for example `entryId::sectionId`). Bare
+   * section paths collide across papers, so callers must qualify them. Empty or
+   * null means the hit has no section and receives no chapter penalty.
+   */
+  sectionKey?: string | null;
 };
 
 export type DiversityOptions = {
   /** An explicit section filter makes same-section evidence intentional. */
   sectionFilter?: string | null;
 };
+
+/** Non-finite backend scores count as 0 so they cannot poison min/max normalization. */
+function finiteScore(score: number) {
+  return Number.isFinite(score) ? score : 0;
+}
 
 export function lexicalTerms(text: string) {
   const terms = new Set<string>();
@@ -58,12 +67,12 @@ export function selectDiverseEvidence<T extends DiversityCandidate>(
   const unique = new Map<string, T>();
   for (const candidate of candidates) {
     const existing = unique.get(candidate.key);
-    if (!existing || candidate.score > existing.score) unique.set(candidate.key, candidate);
+    if (!existing || finiteScore(candidate.score) > finiteScore(existing.score)) unique.set(candidate.key, candidate);
   }
   const pool = [...unique.values()].map((candidate) => ({ candidate, terms: lexicalTerms(candidate.text) }));
   if (pool.length === 0 || limit <= 0) return [];
 
-  const scores = pool.map(({ candidate }) => (Number.isFinite(candidate.score) ? candidate.score : 0));
+  const scores = pool.map(({ candidate }) => finiteScore(candidate.score));
   const max = Math.max(...scores);
   const min = Math.min(...scores);
   const relevance = scores.map((score) => (max > min ? (score - min) / (max - min) : 1));
@@ -80,10 +89,10 @@ export function selectDiverseEvidence<T extends DiversityCandidate>(
         0
       );
       if (redundancy >= DUPLICATE_SIMILARITY) continue;
-      const sameSectionCount = item.candidate.sectionPath
-        ? selected.filter((chosen) => chosen.candidate.sectionPath === item.candidate.sectionPath).length
+      const sameSectionCount = item.candidate.sectionKey
+        ? selected.filter((chosen) => chosen.candidate.sectionKey === item.candidate.sectionKey).length
         : 0;
-      const sectionPenalty = options.sectionFilter || sameSectionCount < 2 ? 0 : 0.15 * sameSectionCount;
+      const sectionPenalty = options.sectionFilter || sameSectionCount < 2 ? 0 : Math.min(0.3, 0.15 * sameSectionCount);
       const value = lambda * item.relevance - (1 - lambda) * redundancy - sectionPenalty;
       // Ties keep the backend order so equal-score results stay deterministic.
       if (value > bestValue || (value === bestValue && item.index < remaining[bestPosition].index)) {

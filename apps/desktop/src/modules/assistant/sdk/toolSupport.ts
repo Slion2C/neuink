@@ -354,7 +354,8 @@ export async function executeTool(
 
   if (toolName === 'search_segments') {
     const results = await invokeAssistantTool<SearchResults>('search_segments', input);
-    return formatSearchSegmentsOutput(results, addSource);
+    const sectionFilter = typeof input.section_filter === 'string' ? input.section_filter : null;
+    return formatSearchSegmentsOutput(results, addSource, sectionFilter);
   }
 
   if (toolName === 'read_segment_content') {
@@ -495,9 +496,15 @@ export function numberMarkdownLines(markdown: string) {
     .join('\n');
 }
 
+function sectionIdentity(entryId: string, source: SearchHit['source']) {
+  const section = source.section_id || source.section_path;
+  return section ? `${entryId}::${section}` : null;
+}
+
 export function formatSearchSegmentsOutput(
   results: SearchResults,
-  addSource: (source: ConversationSourceLink) => number
+  addSource: (source: ConversationSourceLink) => number,
+  sectionFilter?: string | null
 ) {
   // Hits arrive grouped by Entry, so re-rank globally with MMR and collapse
   // segment notes/annotations that point at the same cited segment.
@@ -509,9 +516,11 @@ export function formatSearchSegmentsOutput(
       key: `${hit.target.entry_id}:${hit.target.segment_uid}`,
       score: hit.score,
       text: hit.snippet,
-      sectionPath: hit.source.section_path
+      // Empty strings are not identities; `||` (not `??`) keeps a blank section_id from
+      // collapsing every section of the Entry onto one key.
+      sectionKey: sectionIdentity(hit.target.entry_id, hit.source)
     }));
-  const evidence = selectDiverseEvidence(segmentHits, 12)
+  const evidence = selectDiverseEvidence(segmentHits, 12, 0.7, { sectionFilter })
     .map(({ hit }) => {
       const source: ConversationSourceLink = {
         entry_id: hit.target.entry_id,

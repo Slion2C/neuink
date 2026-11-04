@@ -1,5 +1,19 @@
 # Neuink 开发计划
 
+### 2026-11-03：BookRAG Lite 检索实施记录（生产默认保持 Legacy，章节重排关闭）
+
+- 共享检索入口位于 `crates/neuink-search/src/retrieval_pipeline.rs`（`recall_candidates`、`fuse_query_candidates`、`finalize_candidates`）。IPC 与 bench 共用同一路径。候选窗口为 `max(5K, 60)`，K 截到 200。过滤先于截断，最终 K 只截断一次。
+- 同分候选以 `hit_identity` 作最终 tie-break，修复候选尾部随 HashMap 顺序漂移的问题。RRF 未改。References 只在 finalize 阶段乘 0.35 一次；显式 section_filter（ID 或路径）豁免。
+- 缓存索引格式 v6，表示版本 1，身份为模型内容 blake3、维度与表示版本。译文、boost、显示标签不进入稳定键。章节完整性不足时整题旁路。前端 section 身份按 Entry 限定。
+- 数据：Qasper 原始 dev 1005 题，按哈希划分 select 140 篇（455 题）与 gate 141 篇（467 题）。整题排除（不保留部分 qrels）。float 只按 caption 文本匹配，不证明表内容理解。
+- 冻结结果：select 阶段一赢家 H1；章节最佳 B 的两指标平均增益 0.0013，低于 0.005，章节重排保持关闭。Qasper gate 与 test 的 evaluator 均选中 H1，`reselected` 为 false。test 结果已标注为事后分析的冻结评估。
+- 回归：SciFact 中 H1 点估计通过，Semantic 诊断项失败。COVID（本地中文，非 TREC-COVID）中 H1 相对 Legacy 的 nDCG@10 与 R@10 点估计均失败（−0.019178，−0.013172）。因此生产默认保持 `Legacy`、alpha 0。未挑选 H2 或 H3，未做语言路由。H1 在 Qasper test 的 Overall 双指标为正，这一结果不改变默认。
+- 确定性：两进程比较 select 6 方法 × 455 题的 raw 与 candidate 字段，零差异（证明 `D:\neuink-orchestration\bookrag-v5-determinism-proof.json`）。
+- 测试：`neuink-search` 52 通过（默认）与 53 通过（local-embedding），IPC search 9 通过，parser 单元 40 与集成 2 通过，前端 418 文件、2996 项通过，3 项跳过。
+- 成本协议为固定机器与线程、单方法独立进程、warm 1 次预热加 3 次计时，结果为当前单机有效观测；不保证其他机器或负载下的普适性。冷构建墙钟按 watcher process_start 到 observed_finish 计算，两次冷构建与 COVID 预构建重叠，因此冷构建数值不作隔离比较。
+- 未验收与限制：原生 Tauri UI 未验收（用户物理停止）；IPC 真实原地模型替换无端到端测试；语义索引缺少 limit 1 加高分候选的组合断言；ORT 线程调度未观测。
+- 冻结报告：`D:\neuink-orchestration\bookrag-lite-acceptance.md`；状态 `D:\neuink-orchestration\bookrag-acceptance-state.json`；索引 `D:\neuink-orchestration\bookrag-live-handoff.md`。
+
 ### 2026-10-22：阅读交互与助手改进从 beta 合并到 main
 
 - 按用户明确要求，先提交并推送 beta，再将其合并到 main。纳入 PDF 空格拖动、以中心为锚点的动态滚轮缩放与 1% 微调、译文添加高亮批注、逐句翻译与联动、离线词库、标签合并、助手执行和设置改进，以及使用既有资料的开发启动脚本。

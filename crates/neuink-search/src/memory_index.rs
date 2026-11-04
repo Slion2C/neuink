@@ -9,12 +9,12 @@ use rayon::prelude::*;
 
 use crate::{
     token::{tokenize, tokenize_unique},
-    SearchDocument, SearchDocumentSourceKind, SearchEntryGroup, SearchError, SearchHit,
-    SearchInclude, SearchIndex, SearchMode, SearchQuery, SearchResult, SearchResults,
+    SearchDocument, SearchEntryGroup, SearchError, SearchHit, SearchIndex, SearchMode, SearchQuery,
+    SearchResult, SearchResults,
 };
 
 const QUERY_CACHE_LIMIT: usize = 64;
-const MAX_RESULT_LIMIT: usize = 200;
+const MAX_RESULT_LIMIT: usize = 1000;
 /// Okapi BM25 parameters (Robertson & Zaragoza, 2009), the Lucene/tantivy defaults.
 const BM25_K1: f32 = 1.2;
 const BM25_B: f32 = 0.75;
@@ -150,7 +150,11 @@ impl SearchSnapshot {
     }
 
     fn search(&self, query: &SearchQuery, normalized_query: String) -> SearchResult<SearchResults> {
-        let query_terms = tokenize_unique(&normalized_query);
+        let query_terms = if query.filter_stopwords {
+            crate::token::tokenize_content_query(&normalized_query)
+        } else {
+            tokenize_unique(&normalized_query)
+        };
         if query_terms.is_empty() {
             return Err(SearchError::EmptyQuery);
         }
@@ -180,10 +184,10 @@ impl SearchSnapshot {
             .into_iter()
             .filter_map(|(doc_idx, candidate)| {
                 let indexed = self.documents.get(doc_idx)?;
-                if !query.scope.contains_entry(&indexed.document.entry_id)
-                    || !included_by_query(&query.include, indexed.document.source.kind)
-                    || !matches_section_filter(&query, &indexed.document)
-                {
+                if !crate::embedding_representation::matches_semantic_document(
+                    query,
+                    &indexed.document,
+                ) {
                     return None;
                 }
 
@@ -321,43 +325,6 @@ fn bm25_term_weight(term_frequency: f32, length: f32, average_length: f32) -> f3
     term_frequency * (BM25_K1 + 1.0) / (term_frequency + normalization)
 }
 
-fn included_by_query(include: &SearchInclude, kind: SearchDocumentSourceKind) -> bool {
-    match kind {
-        SearchDocumentSourceKind::EntryTitle
-        | SearchDocumentSourceKind::EntryField
-        | SearchDocumentSourceKind::EntryTag => include.entry_meta,
-        SearchDocumentSourceKind::NoteTitle
-        | SearchDocumentSourceKind::NoteBody
-        | SearchDocumentSourceKind::SegmentNote
-        | SearchDocumentSourceKind::Annotation => include.notes,
-        SearchDocumentSourceKind::PdfPage | SearchDocumentSourceKind::Segment => include.segments,
-    }
-}
-
-fn matches_section_filter(query: &SearchQuery, document: &SearchDocument) -> bool {
-    if let Some(filter) = query.section_filter.as_deref().map(str::trim).filter(|value| !value.is_empty()) {
-        let filter_lower = filter.to_ascii_lowercase();
-        let section_match = document
-            .source
-            .section_id
-            .as_deref()
-            .is_some_and(|id| id == filter)
-            || document
-                .source
-                .section_path
-                .as_deref()
-                .is_some_and(|path| path.to_ascii_lowercase().contains(&filter_lower));
-        if !section_match {
-            return false;
-        }
-    }
-    query.segment_types.is_empty()
-        || document
-            .source
-            .segment_type
-            .is_some_and(|segment_type| query.segment_types.contains(&segment_type))
-}
-
 fn compare_hits(left: &SearchHit, right: &SearchHit) -> Ordering {
     right
         .score
@@ -365,6 +332,8 @@ fn compare_hits(left: &SearchHit, right: &SearchHit) -> Ordering {
         .unwrap_or(Ordering::Equal)
         .then_with(|| left.entry_title.cmp(&right.entry_title))
         .then_with(|| left.title.cmp(&right.title))
+        // Stable identity decides equal titles, so truncation never depends on HashMap order.
+        .then_with(|| crate::hit_identity(left).cmp(&crate::hit_identity(right)))
 }
 
 fn result_mode_and_warnings(mode: SearchMode) -> (String, Vec<String>) {
@@ -396,7 +365,7 @@ fn cache_key(query: &SearchQuery, normalized_query: &str) -> String {
         .collect::<Vec<_>>();
     scope.sort();
     format!(
-        "{}|{:?}|{}|{}:{}:{}|{}|{:?}|{}",
+        "{}|{:?}|{}|{}:{}:{}|{}|{:?}|{}|{}|{}",
         normalized_query,
         query.mode,
         query.limit,
@@ -405,7 +374,9 @@ fn cache_key(query: &SearchQuery, normalized_query: &str) -> String {
         query.include.segments,
         query.section_filter.as_deref().unwrap_or_default(),
         query.segment_types,
-        scope.join(",")
+        scope.join(","),
+        query.segments_only,
+        query.filter_stopwords
     )
 }
 
@@ -461,7 +432,7 @@ mod tests {
     use neuink_domain::{EntryId, SegmentUid};
 
     use super::*;
-    use crate::{SearchDocumentSource, SearchTarget, SearchTextSection};
+    use crate::{SearchDocumentSource, SearchDocumentSourceKind, SearchTarget, SearchTextSection};
 
     #[test]
     fn searches_keyword_documents() {
@@ -643,6 +614,51 @@ mod tests {
             sections: vec![SearchTextSection::body(body)],
             boost: 1.0,
         }
+    }
+
+    fn sectioned_segment(
+        entry: &str,
+        segment: &str,
+        section_path: &str,
+        body: &str,
+        boost: f32,
+    ) -> SearchDocument {
+        let mut document = segment_document(entry, segment, body);
+        document.source.section_path = Some(section_path.to_string());
+        document.boost = boost;
+        document
+    }
+
+    #[test]
+    fn section_filter_runs_before_the_candidate_limit() {
+        let index = MemorySearchIndex::default();
+        index
+            .replace_documents(vec![
+                // Higher-scoring but outside the filter; must not take the single slot.
+                sectioned_segment(
+                    "entry-a",
+                    "seg-off",
+                    "Background",
+                    "attention attention attention",
+                    5.0,
+                ),
+                sectioned_segment(
+                    "entry-a",
+                    "seg-on",
+                    "Methods > Answer",
+                    "attention once",
+                    1.0,
+                ),
+            ])
+            .unwrap();
+        let mut query = SearchQuery::new("attention");
+        query.section_filter = Some("Answer".into());
+        query.limit = 1;
+
+        let results = index.search(query).unwrap();
+
+        assert_eq!(results.total_hit_count, 1);
+        assert!(results.entries[0].hits[0].snippet.contains("once"));
     }
 
     #[test]

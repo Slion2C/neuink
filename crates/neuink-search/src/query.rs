@@ -14,6 +14,12 @@ pub struct SearchQuery {
     pub section_filter: Option<String>,
     #[serde(default)]
     pub segment_types: Vec<SegmentType>,
+    /// Internal retrieval constraint applied before either channel truncates.
+    #[serde(default)]
+    pub segments_only: bool,
+    /// Query-side English stopword filtering; indexing remains unchanged.
+    #[serde(default)]
+    pub filter_stopwords: bool,
     #[serde(default = "default_limit")]
     pub limit: usize,
 }
@@ -27,6 +33,8 @@ impl SearchQuery {
             include: SearchInclude::default(),
             section_filter: None,
             segment_types: Vec::new(),
+            segments_only: false,
+            filter_stopwords: false,
             limit: default_limit(),
         }
     }

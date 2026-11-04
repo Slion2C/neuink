@@ -7,14 +7,13 @@ use std::{
     thread,
     time::{Duration, Instant, SystemTime},
 };
-use rayon::prelude::*;
 
-use neuink_domain::{CanonicalSectionRole, EntryId, SegmentType};
+use neuink_domain::{EntryId, SegmentType};
 use neuink_search::{
-    semantic_index_path, semantic_result_mode, EmbeddingProvider, FastEmbedProvider,
-    MemorySearchIndex, PersistentSemanticSearchIndex, SearchDocument, SearchDocumentSource,
-    SearchDocumentSourceKind, SearchEntryGroup, SearchInclude, SearchIndex, SearchMode,
-    SearchQuery, SearchResults, SearchScope, SearchTarget, SearchTextSection,
+    embed_query_vector, semantic_embedding_identity, semantic_index_path, EmbeddingProvider,
+    FastEmbedProvider, MemorySearchIndex, PersistentSemanticSearchIndex, SearchDocument,
+    SearchDocumentSource, SearchDocumentSourceKind, SearchInclude, SearchIndex, SearchMode,
+    SearchQuery, SearchResults, SearchScope, SearchTarget,
 };
 use neuink_workspace::{
     Workspace, WorkspaceLayout, WorkspaceSearchOptions, WorkspaceSearchRecord,
@@ -30,7 +29,8 @@ const EMBEDDING_PROVIDER_CACHE_LIMIT: usize = 1;
 const CACHE_TTL: Duration = Duration::from_secs(60 * 30);
 const CACHE_CLEANUP_INTERVAL: Duration = Duration::from_secs(60 * 5);
 const DISK_VECTOR_CACHE_TTL: Duration = Duration::from_secs(60 * 60 * 24 * 14);
-const SEMANTIC_INDEX_FORMAT_VERSION: u32 = 5;
+const BOOKRAG_SECTION_ALPHA: f32 = 0.0;
+const SEMANTIC_INDEX_FORMAT_VERSION: u32 = neuink_search::SEMANTIC_INDEX_FORMAT_VERSION;
 
 #[derive(Debug, Deserialize)]
 pub struct SearchEntriesRequest {
@@ -155,6 +155,7 @@ struct CachedSemanticIndex {
 
 struct CachedEmbeddingProvider {
     provider: Arc<FastEmbedProvider>,
+    signature: String,
     last_used: Instant,
 }
 
@@ -184,63 +185,21 @@ pub async fn search_entries<R: tauri::Runtime>(
     app: tauri::AppHandle<R>,
     request: SearchEntriesRequest,
 ) -> Result<SearchResults, String> {
-    let embedding_model_dir = embedding_model_dir(&app)?;
+    let model_dir = embedding_model_dir(&app)?;
     tokio::task::spawn_blocking(move || {
-        let primary_query = request.query.trim().to_string();
-        if primary_query.is_empty() {
-            return Err("query is required".to_string());
-        }
-        let mut queries = vec![(primary_query.clone(), 1.0_f32)];
-        if let Some(english_query) = request
-            .english_query
-            .as_deref()
-            .map(str::trim)
-            .filter(|query| !query.is_empty())
-        {
-            queries.push((english_query.to_string(), 0.9));
-        }
-        for sub_query in request
-            .sub_queries
-            .into_iter()
-            .map(|query| query.trim().to_string())
-            .filter(|query| !query.is_empty())
-            .take(3)
-        {
-            queries.push((sub_query, 0.75));
-        }
-        let scope_entry_ids = request.scope_entry_ids;
-        let section_filter = request.section_filter.clone();
-        let segment_types = parse_segment_types(&request.segment_types);
-        let search_results = queries
-            .par_iter()
-            .map(|(query, _)| {
-                run_search(
-                    embedding_model_dir.clone(),
-                    request.root.clone(),
-                    query.clone(),
-                    scope_entry_ids.clone(),
-                    request.mode,
-                    request.limit.unwrap_or(40),
-                    WorkspaceSearchOptions::default(),
-                    SearchInclude::default(),
-                    section_filter.clone(),
-                    segment_types.clone(),
-                )
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let weights = queries.iter().map(|(_, weight)| *weight).collect::<Vec<_>>();
-        let mut results = merge_query_results(primary_query, search_results, &weights);
-        rerank_section_hits(&mut results, section_filter.as_deref());
-        if contains_cjk(&results.query)
-            && request.english_query.as_deref().is_none_or(|query| query.trim().is_empty())
-            && (results.mode.contains("fallback") || results.total_hit_count == 0)
-        {
-            results.warnings.push(
-                "中文查询未提供 english_query；若目标是英文论文，当前结果可能缺少跨语种匹配。"
-                    .to_string(),
-            );
-        }
-        Ok(results)
+        run_search_bundle(
+            model_dir,
+            request.root,
+            request.query,
+            request.english_query,
+            request.sub_queries,
+            request.scope_entry_ids,
+            request.mode,
+            request.limit.unwrap_or(40).clamp(1, 200),
+            false,
+            request.section_filter,
+            parse_segment_types(&request.segment_types),
+        )
     })
     .await
     .map_err(|error| error.to_string())?
@@ -251,76 +210,177 @@ pub async fn search_segments<R: tauri::Runtime>(
     app: tauri::AppHandle<R>,
     request: SearchSegmentsRequest,
 ) -> Result<SearchResults, String> {
-    let embedding_model_dir = embedding_model_dir(&app)?;
-    // Must match the scope `rebuild_search_index` embeds, otherwise the semantic
-    // cache namespace never exists and hybrid search silently stays keyword-only.
-    let (options, include) = search_scope_options(true);
-    let top_k = request.top_k.unwrap_or(20).clamp(1, 20);
-    let candidate_k = top_k.saturating_mul(5).max(60);
-    let primary_query = request.query.trim().to_string();
-    if primary_query.is_empty() {
-        return Err("query is required".to_string());
-    }
-    let mut queries = vec![(primary_query.clone(), 1.0_f32)];
-    if let Some(english_query) = request
-        .english_query
-        .as_deref()
-        .map(str::trim)
-        .filter(|query| !query.is_empty())
-    {
-        queries.push((english_query.to_string(), 0.9));
-    }
-    for sub_query in request
-        .sub_queries
-        .into_iter()
-        .map(|query| query.trim().to_string())
-        .filter(|query| !query.is_empty())
-        .take(3)
-    {
-        queries.push((sub_query, 0.75));
-    }
-    let scope_entry_ids = request.scope_entry_ids;
-    let section_filter = request.section_filter.clone();
-    let segment_types = parse_segment_types(&request.segment_types);
-    let mode = request.mode;
-    let has_english_query = queries.len() > 1;
+    let model_dir = embedding_model_dir(&app)?;
     tokio::task::spawn_blocking(move || {
-        let search_results = queries
-            .par_iter()
-            .map(|(query, _)| {
-                run_search(
-                    embedding_model_dir.clone(),
-                    request.root.clone(),
-                    query.clone(),
-                    scope_entry_ids.clone(),
-                    mode,
-                    candidate_k,
-                    options.clone(),
-                    include.clone(),
-                    section_filter.clone(),
-                    segment_types.clone(),
-                )
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let weights = queries.iter().map(|(_, weight)| *weight).collect::<Vec<_>>();
-        let mut results = merge_query_results(primary_query, search_results, &weights);
-        if contains_cjk(&results.query)
-            && !has_english_query
-            && (results.mode.contains("fallback") || results.total_hit_count == 0)
-        {
-            results.warnings.push(
-                "中文查询未提供 english_query，且语义索引不可用；英文论文可能没有关键词交集，请配置模型或同时提供英文检索词。"
-                    .to_string(),
-            );
-        }
-        Ok(filter_segment_search_results(results, top_k))
+        run_search_bundle(
+            model_dir,
+            request.root,
+            request.query,
+            request.english_query,
+            request.sub_queries,
+            request.scope_entry_ids,
+            request.mode,
+            request.top_k.unwrap_or(20).clamp(1, 20),
+            true,
+            request.section_filter,
+            parse_segment_types(&request.segment_types),
+        )
     })
     .await
     .map_err(|error| error.to_string())?
 }
 
+fn run_search_bundle(
+    model_dir: PathBuf,
+    root: PathBuf,
+    primary: String,
+    english: Option<String>,
+    sub_queries: Vec<String>,
+    scope: Vec<EntryId>,
+    mode: SearchMode,
+    limit: usize,
+    segments_only: bool,
+    section_filter: Option<String>,
+    segment_types: Vec<SegmentType>,
+) -> Result<SearchResults, String> {
+    let primary = primary.trim().to_string();
+    if primary.is_empty() {
+        return Err("query is required".into());
+    }
+    let (options, include) = search_scope_options(segments_only);
+    let workspace = Workspace::open(&root).map_err(|e| e.to_string())?;
+    clean_disk_vector_cache(&root);
+    let records = workspace
+        .collect_search_records(options.clone())
+        .map_err(|e| e.to_string())?;
+    let documents = records
+        .iter()
+        .cloned()
+        .filter_map(search_document)
+        .collect::<Vec<_>>();
+    let keyword = cached_index(
+        &root,
+        &options,
+        records_fingerprint(&records),
+        documents.clone(),
+    )?;
+    let provider = cached_embedding_provider(model_dir).map_err(|e| e.to_string())?;
+    let semantic_fingerprint = semantic_records_fingerprint(&records);
+    let semantic = if mode != SearchMode::Keyword {
+        try_cached_semantic_index(
+            &root,
+            &options,
+            semantic_fingerprint,
+            &include,
+            &documents,
+            provider.as_ref(),
+        )
+    } else {
+        None
+    };
+    if mode != SearchMode::Keyword && semantic.is_none() {
+        schedule_legacy_semantic_rebuild(
+            &root,
+            &options,
+            semantic_fingerprint,
+            &include,
+            &documents,
+            provider.clone(),
+        );
+    }
+    let template = SearchQuery {
+        text: primary.clone(),
+        mode,
+        scope: SearchScope { entry_ids: scope },
+        include,
+        section_filter,
+        segment_types,
+        segments_only,
+        filter_stopwords: false,
+        limit,
+    };
+    let mut queries = vec![(primary.clone(), 1.0)];
+    if let Some(q) = english.as_deref().map(str::trim).filter(|q| !q.is_empty()) {
+        queries.push((q.to_string(), 0.9));
+    }
+    for q in sub_queries
+        .into_iter()
+        .map(|q| q.trim().to_string())
+        .filter(|q| !q.is_empty())
+        .take(3)
+    {
+        if !queries.iter().any(|(existing, _)| existing == &q) {
+            queries.push((q, 0.75));
+        }
+    }
+    let window = neuink_search::candidate_window(limit);
+    let mut primary_vector = None;
+    let mut lists = Vec::new();
+    for (i, (text, _)) in queries.iter().enumerate() {
+        let mut query = template.clone();
+        query.text = text.clone();
+        let vector = if semantic.is_some() && mode != SearchMode::Keyword {
+            embed_query_vector(provider.as_ref(), text).ok()
+        } else {
+            None
+        };
+        let result = neuink_search::recall_candidates(
+            &keyword,
+            semantic.as_deref(),
+            &query,
+            vector.as_deref(),
+            production_hybrid_policy(&query),
+            window,
+        );
+        let result = match result {
+            Ok(result) => result,
+            Err(error) => {
+                query.limit = window;
+                keyword_fallback(&keyword, query, error)?
+            }
+        };
+        if i == 0 {
+            primary_vector = vector;
+        }
+        lists.push(result);
+    }
+    let weights = queries
+        .iter()
+        .map(|(_, weight)| *weight)
+        .collect::<Vec<_>>();
+    let fused = neuink_search::fuse_query_candidates(&primary, &lists, &weights);
+    let chapters = if BOOKRAG_SECTION_ALPHA > 0.0 {
+        semantic.as_ref().map(|index| index.chapter_centroids())
+    } else {
+        None
+    };
+    let mut result = neuink_search::finalize_candidates(
+        fused,
+        &template,
+        primary_vector.as_deref(),
+        chapters,
+        BOOKRAG_SECTION_ALPHA,
+        true,
+    );
+    if contains_cjk(&primary)
+        && queries.len() == 1
+        && (result.mode.contains("fallback") || result.total_hit_count == 0)
+    {
+        result
+            .warnings
+            .push("中文查询未提供英文检索词；请检查本地向量索引，或显式开启双语扩展。".into());
+    }
+    Ok(result)
+}
+
+// Updated only from the frozen selection and independent gate report.
+fn production_hybrid_policy(_query: &SearchQuery) -> neuink_search::HybridPolicy {
+    neuink_search::HybridPolicy::Legacy
+}
+
 fn contains_cjk(text: &str) -> bool {
-    text.chars().any(|ch| matches!(ch, '\u{3400}'..='\u{4dbf}' | '\u{4e00}'..='\u{9fff}'))
+    text.chars()
+        .any(|ch| matches!(ch, '\u{3400}'..='\u{4dbf}' | '\u{4e00}'..='\u{9fff}'))
 }
 
 fn parse_segment_types(values: &[String]) -> Vec<SegmentType> {
@@ -341,128 +401,13 @@ fn parse_segment_types(values: &[String]) -> Vec<SegmentType> {
         .collect()
 }
 
-fn merge_query_results(
-    query: String,
-    results: Vec<SearchResults>,
-    weights: &[f32],
-) -> SearchResults {
-    let Some(first) = results.first() else {
-        return SearchResults {
-            query,
-            mode: "keyword".to_string(),
-            index_generation: 0,
-            total_hit_count: 0,
-            entries: Vec::new(),
-            warnings: Vec::new(),
-        };
-    };
-    if results.len() == 1 {
-        let mut result = first.clone();
-        result.query = query;
-        return result;
-    }
-
-    let ranked = results
-        .iter()
-        .map(|result| {
-            result
-                .entries
-                .iter()
-                .flat_map(|entry| entry.hits.iter())
-                .map(|hit| search_hit_key(hit))
-                .collect::<Vec<_>>()
-        })
-        .collect::<Vec<_>>();
-    let fused = neuink_search::weighted_reciprocal_rank_fusion(&ranked, weights, 60.0);
-    let mut hits_by_key = std::collections::BTreeMap::new();
-    for result in results.iter() {
-        for hit in result.entries.iter().flat_map(|entry| entry.hits.iter()) {
-            hits_by_key
-                .entry(search_hit_key(hit))
-                .or_insert_with(|| hit.clone());
-        }
-    }
-    let mut hits = fused
-        .into_iter()
-        .filter_map(|(key, score)| {
-            let mut hit = hits_by_key.remove(&key)?;
-            hit.score = score;
-            Some(hit)
-        })
-        .collect::<Vec<_>>();
-    hits.sort_by(|left, right| {
-        right
-            .score
-            .partial_cmp(&left.score)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| left.entry_title.cmp(&right.entry_title))
-            .then_with(|| left.title.cmp(&right.title))
-    });
-    let mut warnings = results
-        .iter()
-        .flat_map(|result| result.warnings.iter().cloned())
-        .collect::<Vec<_>>();
-    warnings.sort();
-    warnings.dedup();
-    let mode = if first.mode.contains("fallback") {
-        first.mode.clone()
-    } else {
-        "hybrid".to_string()
-    };
-    let mut grouped = std::collections::BTreeMap::<String, SearchEntryGroup>::new();
-    for hit in hits {
-        let key = hit.entry_id.as_str().to_string();
-        let group = grouped.entry(key).or_insert_with(|| SearchEntryGroup {
-            entry_id: hit.entry_id.clone(),
-            entry_title: hit.entry_title.clone(),
-            hit_count: 0,
-            max_score: hit.score,
-            hits: Vec::new(),
-        });
-        group.hit_count += 1;
-        group.max_score = group.max_score.max(hit.score);
-        group.hits.push(hit);
-    }
-    let mut entries = grouped.into_values().collect::<Vec<_>>();
-    entries.sort_by(|left, right| {
-        right
-            .max_score
-            .partial_cmp(&left.max_score)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| left.entry_title.cmp(&right.entry_title))
-    });
-    SearchResults {
-        query,
-        mode,
-        index_generation: first.index_generation,
-        total_hit_count: entries.iter().map(|entry| entry.hit_count).sum(),
-        entries,
-        warnings,
-    }
-}
-
-fn search_hit_key(hit: &neuink_search::SearchHit) -> String {
-    match &hit.target {
-        neuink_search::SearchTarget::Segment {
-            entry_id,
-            segment_uid,
-            ..
-        } => format!("segment:{}:{}", entry_id, segment_uid),
-        neuink_search::SearchTarget::Page { entry_id, page_idx } => {
-            format!("page:{}:{}", entry_id, page_idx)
-        }
-        neuink_search::SearchTarget::Note { entry_id, note_id } => {
-            format!("note:{}:{}", entry_id, note_id)
-        }
-        neuink_search::SearchTarget::Entry { entry_id } => format!("entry:{}", entry_id),
-    }
-}
-
 #[tauri::command]
-pub async fn get_search_index_status(
+pub async fn get_search_index_status<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
     request: SearchIndexStatusRequest,
 ) -> Result<SearchIndexStatus, String> {
-    tokio::task::spawn_blocking(move || get_search_index_status_impl(request))
+    let model_dir = embedding_model_dir(&app)?;
+    tokio::task::spawn_blocking(move || get_search_index_status_impl(request, model_dir))
         .await
         .map_err(|error| error.to_string())?
 }
@@ -495,65 +440,9 @@ pub async fn rebuild_search_index<R: tauri::Runtime>(
     .map_err(|error| error.to_string())?
 }
 
-fn run_search(
-    embedding_model_dir: PathBuf,
-    root: PathBuf,
-    query: String,
-    scope_entry_ids: Vec<EntryId>,
-    mode: SearchMode,
-    limit: usize,
-    options: WorkspaceSearchOptions,
-    include: SearchInclude,
-    section_filter: Option<String>,
-    segment_types: Vec<SegmentType>,
-) -> Result<SearchResults, String> {
-    let workspace = Workspace::open(&root).map_err(|error| error.to_string())?;
-    clean_disk_vector_cache(&root);
-    let records = workspace
-        .collect_search_records(options.clone())
-        .map_err(|error| error.to_string())?;
-    let documents = records
-        .iter()
-        .cloned()
-        .filter_map(search_document)
-        .collect::<Vec<_>>();
-    let records_fingerprint = records_fingerprint(&records);
-    let semantic_fingerprint = semantic_records_fingerprint(&records);
-    let index = cached_index(&root, &options, records_fingerprint, documents.clone())?;
-    let search_query = SearchQuery {
-        text: query,
-        mode,
-        scope: SearchScope {
-            entry_ids: scope_entry_ids,
-        },
-        include,
-        section_filter,
-        segment_types,
-        limit,
-    };
-
-    if mode == SearchMode::Keyword {
-        return index
-            .search(search_query)
-            .map_err(|error| error.to_string());
-    }
-
-    match run_semantic_search(
-        embedding_model_dir,
-        &index,
-        &documents,
-        &root,
-        &options,
-        semantic_fingerprint,
-        search_query.clone(),
-    ) {
-        Ok(results) => Ok(results),
-        Err(error) => keyword_fallback(&index, search_query, error),
-    }
-}
-
 fn get_search_index_status_impl(
     request: SearchIndexStatusRequest,
+    model_dir: PathBuf,
 ) -> Result<SearchIndexStatus, String> {
     let (scope, options, include) = search_scope_status_options(request.segments_only);
     let workspace = Workspace::open(&request.root).map_err(|error| error.to_string())?;
@@ -583,25 +472,21 @@ fn get_search_index_status_impl(
         })
         .unwrap_or(false);
 
-    let semantic_cache_key = semantic_cache_key(&request.root, &options, &include);
-    let semantic_memory_cache_ready = SEMANTIC_INDEX_CACHE
-        .get_or_init(|| Mutex::new(HashMap::new()))
-        .lock()
-        .ok()
-        .and_then(|cache| {
-            cache
-                .get(&semantic_cache_key)
-                .map(|cached| cached.fingerprint == semantic_fingerprint)
-        })
-        .unwrap_or(false);
+    let provider = cached_embedding_provider(model_dir).map_err(|e| e.to_string())?;
+    let identity = semantic_embedding_identity(provider.as_ref());
+    let semantic_cache_key =
+        model_semantic_cache_key(&request.root, &options, &include, identity.as_deref());
+    let semantic_memory_cache_ready =
+        lookup_semantic_memory(semantic_cache_key.as_deref(), semantic_fingerprint).is_some();
 
     let cache_dir = WorkspaceLayout::new(request.root.clone()).cache_dir();
-    let namespace = semantic_cache_namespace(&request.root, &options, &include);
+    let namespace =
+        semantic_cache_namespace(&request.root, &options, &include, identity.as_deref());
     let semantic_disk_cache_path = semantic_index_path(cache_dir, &namespace);
     let disk_cache = read_semantic_disk_cache_status(&semantic_disk_cache_path);
     let semantic_disk_cache_ready = disk_cache
         .as_ref()
-        .is_some_and(|status| status.current_for(semantic_fingerprint));
+        .is_some_and(|status| status.current_for(semantic_fingerprint, identity.as_deref()));
     let semantic_disk_cache_modified_at_ms = semantic_disk_cache_path
         .metadata()
         .ok()
@@ -640,8 +525,8 @@ fn rebuild_search_index_impl(
     // `open_or_build_with_progress` only embeds documents that are new or
     // changed since the last build instead of re-embedding the workspace.
     let workspace = Workspace::open(&request.root).map_err(|error| error.to_string())?;
-    let provider =
-        cached_embedding_provider(embedding_model_dir).map_err(|error| error.to_string())?;
+    let provider = cached_embedding_provider(embedding_model_dir.clone())
+        .map_err(|error| error.to_string())?;
 
     // A global build also refreshes the segments-only scope so assistant
     // segment search keeps working after the startup warmup was removed.
@@ -692,10 +577,13 @@ fn rebuild_search_index_impl(
         .map_err(|error| error.to_string())?;
     }
 
-    let status = get_search_index_status_impl(SearchIndexStatusRequest {
-        root: request.root,
-        segments_only: request.segments_only,
-    })?;
+    let status = get_search_index_status_impl(
+        SearchIndexStatusRequest {
+            root: request.root,
+            segments_only: request.segments_only,
+        },
+        embedding_model_dir,
+    )?;
     Ok(RebuildSearchIndexResponse {
         status,
         rebuilt_vector_count: semantic_document_count,
@@ -743,86 +631,52 @@ fn cached_index(
     Ok(index)
 }
 
-fn run_semantic_search(
-    embedding_model_dir: PathBuf,
-    keyword_index: &MemorySearchIndex,
-    documents: &[SearchDocument],
-    root: &PathBuf,
-    options: &WorkspaceSearchOptions,
-    records_fingerprint: u64,
-    query: SearchQuery,
-) -> Result<SearchResults, neuink_search::SearchError> {
-    let normalized_query = query.normalized_text();
-    if normalized_query.is_empty() {
-        return Err(neuink_search::SearchError::EmptyQuery);
-    }
+/// Files whose length or mtime changes when a model is replaced in place. The
+/// provider hashes contents once, so a changed signature must drop the provider.
+const MODEL_SIGNATURE_FILES: &[&str] = &[
+    "onnx/model.onnx",
+    "model.onnx",
+    "tokenizer.json",
+    "config.json",
+    "special_tokens_map.json",
+    "tokenizer_config.json",
+    "sentencepiece.bpe.model",
+    "neuink-embedding.json",
+];
 
-    let provider = cached_embedding_provider(embedding_model_dir)?;
-    let Some(semantic_index) = try_cached_semantic_index(
-        root,
-        options,
-        records_fingerprint,
-        &query.include,
-        documents,
-    ) else {
-        schedule_legacy_semantic_rebuild(
-            root,
-            options,
-            records_fingerprint,
-            &query.include,
-            documents,
-            provider,
-        );
-        return Err(neuink_search::SearchError::EmbeddingUnavailable(
-            "向量索引尚未构建或正在后台重建；当前返回关键词结果。".to_string(),
-        ));
-    };
-    let candidate_limit = query.limit.saturating_mul(5).max(60);
-    let mut candidate_query = query.clone();
-    candidate_query.limit = candidate_limit;
-    let semantic_query = if query.mode == SearchMode::Hybrid {
-        &candidate_query
-    } else {
-        &query
-    };
-    let semantic_results = semantic_index.search(
-        semantic_query,
-        &normalized_query,
-        provider.as_ref(),
-        semantic_result_mode(query.mode),
-        Vec::new(),
-        keyword_index.generation()?,
-    )?;
-
-    if query.mode == SearchMode::Semantic {
-        return Ok(semantic_results);
-    }
-
-    let mut keyword_query = candidate_query;
-    keyword_query.mode = SearchMode::Keyword;
-    let keyword_results = keyword_index.search(keyword_query)?;
-    Ok(neuink_search::merge_hybrid_results(
-        normalized_query,
-        keyword_index.generation()?,
-        keyword_results,
-        semantic_results,
-        query.limit,
-        Vec::new(),
-    ))
+fn model_metadata_signature(model_dir: &std::path::Path) -> String {
+    MODEL_SIGNATURE_FILES
+        .iter()
+        .map(
+            |relative| match std::fs::metadata(model_dir.join(relative)) {
+                Ok(metadata) => format!(
+                    "{relative}:{}:{:?}",
+                    metadata.len(),
+                    metadata.modified().ok()
+                ),
+                Err(_) => format!("{relative}:-"),
+            },
+        )
+        .collect::<Vec<_>>()
+        .join("|")
 }
 
 fn cached_embedding_provider(
     embedding_model_dir: PathBuf,
 ) -> Result<Arc<FastEmbedProvider>, neuink_search::SearchError> {
     let cache_key = embedding_model_dir.display().to_string();
+    let signature = model_metadata_signature(&embedding_model_dir);
     let cache = EMBEDDING_PROVIDER_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
     let mut cache = cache
         .lock()
         .map_err(|_| neuink_search::SearchError::LockPoisoned)?;
     if let Some(cached) = cache.get_mut(&cache_key) {
-        cached.last_used = Instant::now();
-        return Ok(cached.provider.clone());
+        if cached.signature == signature {
+            cached.last_used = Instant::now();
+            return Ok(cached.provider.clone());
+        }
     }
+    cache.remove(&cache_key);
 
     let provider = Arc::new(FastEmbedProvider::from_model_dir(embedding_model_dir));
     if !provider.status().available {
@@ -832,6 +686,7 @@ fn cached_embedding_provider(
         cache_key,
         CachedEmbeddingProvider {
             provider: provider.clone(),
+            signature,
             last_used: Instant::now(),
         },
     );
@@ -848,18 +703,9 @@ fn cached_semantic_index(
     provider: Arc<FastEmbedProvider>,
     progress_scope: Option<&str>,
 ) -> Result<Arc<PersistentSemanticSearchIndex>, neuink_search::SearchError> {
-    let cache_key = semantic_cache_key(root, options, include);
-    let cache = SEMANTIC_INDEX_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    if let Some(index) = cache
-        .lock()
-        .map_err(|_| neuink_search::SearchError::LockPoisoned)?
-        .get_mut(&cache_key)
-        .filter(|cached| cached.fingerprint == records_fingerprint)
-        .map(|cached| {
-            cached.last_used = Instant::now();
-            cached.index.clone()
-        })
-    {
+    let identity = semantic_embedding_identity(provider.as_ref());
+    let cache_key = model_semantic_cache_key(root, options, include, identity.as_deref());
+    if let Some(index) = lookup_semantic_memory(cache_key.as_deref(), records_fingerprint) {
         return Ok(index);
     }
 
@@ -867,21 +713,13 @@ fn cached_semantic_index(
         .get_or_init(|| Mutex::new(()))
         .lock()
         .map_err(|_| neuink_search::SearchError::LockPoisoned)?;
-    if let Some(index) = cache
-        .lock()
-        .map_err(|_| neuink_search::SearchError::LockPoisoned)?
-        .get_mut(&cache_key)
-        .filter(|cached| cached.fingerprint == records_fingerprint)
-        .map(|cached| {
-            cached.last_used = Instant::now();
-            cached.index.clone()
-        })
-    {
+    if let Some(index) = lookup_semantic_memory(cache_key.as_deref(), records_fingerprint) {
         return Ok(index);
     }
 
     let cache_dir = WorkspaceLayout::new(root.clone()).cache_dir();
-    let namespace = semantic_cache_namespace(root, options, include);
+    let identity = semantic_embedding_identity(provider.as_ref());
+    let namespace = semantic_cache_namespace(root, options, include, identity.as_deref());
     let index_path = semantic_index_path(cache_dir, &namespace);
     let scope = progress_scope.unwrap_or("semantic");
     let semantic_total = documents
@@ -924,18 +762,22 @@ fn cached_semantic_index(
             return Err(error);
         }
     };
-    let mut cache = cache
-        .lock()
-        .map_err(|_| neuink_search::SearchError::LockPoisoned)?;
-    cache.insert(
-        cache_key,
-        CachedSemanticIndex {
-            fingerprint: records_fingerprint,
-            index: index.clone(),
-            last_used: Instant::now(),
-        },
-    );
-    trim_semantic_cache(&mut cache);
+    // Unknown identity: the index serves this build only and is never reused from memory.
+    if let Some(cache_key) = cache_key {
+        let cache = SEMANTIC_INDEX_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+        let mut cache = cache
+            .lock()
+            .map_err(|_| neuink_search::SearchError::LockPoisoned)?;
+        cache.insert(
+            cache_key,
+            CachedSemanticIndex {
+                fingerprint: records_fingerprint,
+                index: index.clone(),
+                last_used: Instant::now(),
+            },
+        );
+        trim_semantic_cache(&mut cache);
+    }
     finish_search_build(
         root,
         format!(
@@ -956,43 +798,39 @@ fn try_cached_semantic_index(
     records_fingerprint: u64,
     include: &SearchInclude,
     documents: &[SearchDocument],
+    provider: &FastEmbedProvider,
 ) -> Option<Arc<PersistentSemanticSearchIndex>> {
-    let cache_key = semantic_cache_key(root, options, include);
-    let cache = SEMANTIC_INDEX_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    if let Some(index) = cache
-        .lock()
-        .ok()?
-        .get_mut(&cache_key)
-        .filter(|cached| cached.fingerprint == records_fingerprint)
-        .map(|cached| {
-            cached.last_used = Instant::now();
-            cached.index.clone()
-        })
-    {
+    let identity = semantic_embedding_identity(provider)?;
+    let cache_key = model_semantic_cache_key(root, options, include, Some(&identity));
+    if let Some(index) = lookup_semantic_memory(cache_key.as_deref(), records_fingerprint) {
         return Some(index);
     }
 
     let cache_dir = WorkspaceLayout::new(root.clone()).cache_dir();
-    let namespace = semantic_cache_namespace(root, options, include);
+    let namespace = semantic_cache_namespace(root, options, include, Some(&identity));
     let index_path = semantic_index_path(cache_dir, &namespace);
-    let index = PersistentSemanticSearchIndex::open_cached(
+    let index = PersistentSemanticSearchIndex::open_cached_with_identity(
         &index_path,
         documents,
         include,
         records_fingerprint,
+        &identity,
     )
     .ok()??;
     let index = Arc::new(index);
-    if let Ok(mut cache) = cache.lock() {
-        cache.insert(
-            cache_key,
-            CachedSemanticIndex {
-                fingerprint: records_fingerprint,
-                index: index.clone(),
-                last_used: Instant::now(),
-            },
-        );
-        trim_semantic_cache(&mut cache);
+    if let Some(cache_key) = cache_key {
+        let cache = SEMANTIC_INDEX_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+        if let Ok(mut cache) = cache.lock() {
+            cache.insert(
+                cache_key,
+                CachedSemanticIndex {
+                    fingerprint: records_fingerprint,
+                    index: index.clone(),
+                    last_used: Instant::now(),
+                },
+            );
+            trim_semantic_cache(&mut cache);
+        }
     }
     Some(index)
 }
@@ -1006,7 +844,8 @@ fn schedule_legacy_semantic_rebuild(
     provider: Arc<FastEmbedProvider>,
 ) {
     let cache_dir = WorkspaceLayout::new(root.clone()).cache_dir();
-    let namespace = semantic_cache_namespace(root, options, include);
+    let identity = semantic_embedding_identity(provider.as_ref());
+    let namespace = semantic_cache_namespace(root, options, include, identity.as_deref());
     let index_path = semantic_index_path(cache_dir, &namespace);
     let cache_status = read_semantic_disk_cache_status(&index_path);
     if !should_schedule_legacy_semantic_rebuild(cache_status.as_ref(), provider.status().available)
@@ -1014,7 +853,12 @@ fn schedule_legacy_semantic_rebuild(
         return;
     }
 
-    let active_key = semantic_cache_key(root, options, include);
+    // Dedupe key only; reuse decisions go through `model_semantic_cache_key`.
+    let active_key = format!(
+        "{}|{}",
+        semantic_cache_key(root, options, include),
+        identity.as_deref().unwrap_or("unknown-identity")
+    );
     let active = SEMANTIC_AUTO_REBUILD_KEYS.get_or_init(|| Mutex::new(HashSet::new()));
     let Ok(mut active_keys) = active.lock() else {
         return;
@@ -1069,6 +913,31 @@ fn should_schedule_legacy_semantic_rebuild(
 ) -> bool {
     provider_available
         && cache_status.is_some_and(|status| status.version != SEMANTIC_INDEX_FORMAT_VERSION)
+}
+
+/// `None` for an unknown model identity. Such entries are never stored or reused
+/// from memory, because unidentified models would otherwise share one key.
+fn model_semantic_cache_key(
+    root: &PathBuf,
+    options: &WorkspaceSearchOptions,
+    include: &SearchInclude,
+    identity: Option<&str>,
+) -> Option<String> {
+    identity.map(|identity| format!("{}|{identity}", semantic_cache_key(root, options, include)))
+}
+
+fn lookup_semantic_memory(
+    cache_key: Option<&str>,
+    records_fingerprint: u64,
+) -> Option<Arc<PersistentSemanticSearchIndex>> {
+    let key = cache_key?;
+    let cache = SEMANTIC_INDEX_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut cache = cache.lock().ok()?;
+    let cached = cache
+        .get_mut(key)
+        .filter(|cached| cached.fingerprint == records_fingerprint)?;
+    cached.last_used = Instant::now();
+    Some(cached.index.clone())
 }
 
 fn semantic_cache_key(
@@ -1462,57 +1331,34 @@ fn search_document(record: WorkspaceSearchRecord) -> Option<SearchDocument> {
     };
     let label = source_label(&record);
 
-    let title_section = if record.kind == WorkspaceSearchRecordKind::Segment {
-        SearchTextSection::with_boost("title", record.title.clone(), 0.25)
-    } else {
-        SearchTextSection::title(record.title.clone())
-    };
-
-    Some(SearchDocument {
-        entry_id: record.entry_id,
-        entry_title: record.entry_title,
-        source: SearchDocumentSource {
-            kind: source_kind,
-            label,
-            field_name: record.field_name,
-            tag_id: record.tag_id,
-            note_id: record.note_id,
-            segment_uid: record.segment_uid,
-            page_idx: record.page_idx,
-            section_id: record.section_id.clone(),
-            section_path: record.section_path.clone(),
-            section_role: record.section_role,
-            segment_type: record.segment_type,
-        },
-        target,
-        title: record.title,
-        sections: {
-            let mut sections = vec![title_section];
-            if let Some(path) = record.section_path.clone().filter(|path| !path.trim().is_empty()) {
-                sections.push(SearchTextSection::with_boost("section_path", path, 1.6));
-            }
-            if let Some(caption) = record.caption.clone().filter(|caption| !caption.trim().is_empty()) {
-                sections.push(SearchTextSection::with_boost("caption", caption, 1.8));
-            }
-            sections.push(SearchTextSection::body(record.text));
-            if let Some(translation) = record.translation {
-                sections.push(SearchTextSection::with_boost(
-                    "translation",
-                    translation,
-                    0.85,
-                ));
-            }
-            sections
-        },
-        boost: source_boost(record.kind)
-            * if record.section_role == Some(CanonicalSectionRole::References) {
-                0.35
-            } else {
-                1.0
+    Some(neuink_search::compose_search_document(
+        neuink_search::SearchDocumentInput {
+            entry_id: record.entry_id,
+            entry_title: record.entry_title,
+            source: SearchDocumentSource {
+                kind: source_kind,
+                label,
+                field_name: record.field_name,
+                tag_id: record.tag_id,
+                note_id: record.note_id,
+                segment_uid: record.segment_uid,
+                page_idx: record.page_idx,
+                section_id: record.section_id,
+                section_path: record.section_path,
+                section_role: record.section_role,
+                segment_type: record.segment_type,
             },
-    })
+            target,
+            title: record.title,
+            body: record.text,
+            caption: record.caption,
+            translation: record.translation,
+            boost: source_boost(record.kind),
+        },
+    ))
 }
 
+#[cfg(test)]
 fn filter_segment_search_results(mut results: SearchResults, limit: usize) -> SearchResults {
     let mut hits = results
         .entries
@@ -1555,50 +1401,6 @@ fn filter_segment_search_results(mut results: SearchResults, limit: usize) -> Se
     results.entries = entries;
     results.total_hit_count = results.entries.iter().map(|entry| entry.hit_count).sum();
     results
-}
-
-fn rerank_section_hits(results: &mut SearchResults, section_filter: Option<&str>) {
-    let plan = neuink_search::infer_query_plan(&results.query);
-    let filter_mentions_references = section_filter
-        .unwrap_or_default()
-        .to_ascii_lowercase()
-        .contains("reference");
-    for hit in results.entries.iter_mut().flat_map(|entry| entry.hits.iter_mut()) {
-        let role_bonus = plan
-            .section_role
-            .zip(hit.source.section_role)
-            .map(|(expected, actual)| if expected == actual { 1.15 } else { 1.0 })
-            .unwrap_or(1.0);
-        let modality_bonus = match (plan.modality, hit.source.segment_type) {
-            (neuink_search::QueryModality::Table, Some(SegmentType::Table))
-            | (neuink_search::QueryModality::Figure, Some(SegmentType::Figure))
-            | (neuink_search::QueryModality::Math, Some(SegmentType::Math)) => 1.15,
-            _ => 1.0,
-        };
-        let reference_penalty = if hit.source.section_role == Some(CanonicalSectionRole::References)
-            && !filter_mentions_references
-        {
-            0.35
-        } else {
-            1.0
-        };
-        hit.score *= role_bonus * modality_bonus * reference_penalty;
-    }
-    for entry in &mut results.entries {
-        entry.hits.sort_by(|left, right| {
-            right
-                .score
-                .partial_cmp(&left.score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        entry.max_score = entry.hits.first().map(|hit| hit.score).unwrap_or(0.0);
-    }
-    results.entries.sort_by(|left, right| {
-        right
-            .max_score
-            .partial_cmp(&left.max_score)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
 }
 
 fn source_kind(kind: WorkspaceSearchRecordKind) -> SearchDocumentSourceKind {
@@ -1748,12 +1550,15 @@ fn semantic_cache_namespace(
     root: &PathBuf,
     options: &WorkspaceSearchOptions,
     include: &SearchInclude,
+    identity: Option<&str>,
 ) -> String {
     let mut hasher = DefaultHasher::new();
     workspace_cache_key(root, options).hash(&mut hasher);
     include.entry_meta.hash(&mut hasher);
     include.notes.hash(&mut hasher);
     include.segments.hash(&mut hasher);
+    identity.unwrap_or("unknown-model").hash(&mut hasher);
+    neuink_search::EMBEDDING_REPRESENTATION_VERSION.hash(&mut hasher);
     format!("semantic-{:016x}", hasher.finish())
 }
 
@@ -1803,14 +1608,18 @@ fn records_fingerprint_with_translation(
 }
 
 #[cfg(test)]
+use neuink_search::SearchEntryGroup;
+
+#[cfg(test)]
 mod tests {
     use std::{fs, time::SystemTime};
 
     use super::{
         begin_search_build, filter_segment_search_results, load_search_build_status,
-        records_fingerprint, search_build_status_path, search_scope_options,
-        semantic_cache_namespace, update_search_build_progress, SearchIndexBuildState,
-        SearchIndexBuildStatus, WorkspaceSearchRecord, WorkspaceSearchRecordKind,
+        lookup_semantic_memory, model_semantic_cache_key, records_fingerprint,
+        search_build_status_path, search_scope_options, semantic_cache_namespace,
+        update_search_build_progress, SearchIndexBuildState, SearchIndexBuildStatus,
+        WorkspaceSearchRecord, WorkspaceSearchRecordKind,
     };
     use neuink_domain::EntryId;
     use neuink_search::{
@@ -1838,9 +1647,26 @@ mod tests {
 
         assert_eq!(include, assistant_include);
         assert_eq!(
-            semantic_cache_namespace(&root, &options, &include),
-            semantic_cache_namespace(&root, &assistant_options, &assistant_include)
+            semantic_cache_namespace(&root, &options, &include, None),
+            semantic_cache_namespace(&root, &assistant_options, &assistant_include, None)
         );
+    }
+
+    #[test]
+    fn unknown_identity_has_no_memory_key_and_known_identities_stay_separate() {
+        let root = std::path::PathBuf::from("workspace");
+        let (options, include) = search_scope_options(false);
+
+        assert_eq!(
+            model_semantic_cache_key(&root, &options, &include, None),
+            None,
+            "unknown identity must never produce a reusable memory key"
+        );
+        let model_a = model_semantic_cache_key(&root, &options, &include, Some("model-a"));
+        let model_b = model_semantic_cache_key(&root, &options, &include, Some("model-b"));
+        assert!(model_a.is_some());
+        assert_ne!(model_a, model_b);
+        assert!(lookup_semantic_memory(None, 1).is_none());
     }
 
     #[test]
@@ -1929,15 +1755,41 @@ mod tests {
     }
 
     #[test]
+    fn disk_status_ready_only_for_exact_model_identity() {
+        let status = super::SemanticDiskCacheStatus {
+            version: super::SEMANTIC_INDEX_FORMAT_VERSION,
+            fingerprint: 9,
+            representation_version: neuink_search::EMBEDDING_REPRESENTATION_VERSION,
+            embedding_identity: Some("model-a".to_string()),
+            record_count: 1,
+        };
+        assert!(status.current_for(9, Some("model-a")));
+        assert!(!status.current_for(9, Some("model-b")));
+        assert!(!status.current_for(9, None));
+        assert!(!status.current_for(8, Some("model-a")));
+
+        let identityless = super::SemanticDiskCacheStatus {
+            embedding_identity: None,
+            ..status
+        };
+        assert!(!identityless.current_for(9, None));
+        assert!(!identityless.current_for(9, Some("model-a")));
+    }
+
+    #[test]
     fn legacy_semantic_cache_is_rebuilt_only_when_provider_and_version_require_it() {
         let legacy = super::SemanticDiskCacheStatus {
             version: super::SEMANTIC_INDEX_FORMAT_VERSION - 1,
             fingerprint: 1,
+            representation_version: 0,
+            embedding_identity: None,
             record_count: 2,
         };
         let current = super::SemanticDiskCacheStatus {
             version: super::SEMANTIC_INDEX_FORMAT_VERSION,
             fingerprint: 1,
+            representation_version: neuink_search::EMBEDDING_REPRESENTATION_VERSION,
+            embedding_identity: Some("model-a".to_string()),
             record_count: 2,
         };
 
@@ -2058,6 +1910,10 @@ mod tests {
 struct SemanticDiskCacheSnapshot {
     version: u32,
     fingerprint: u64,
+    #[serde(default)]
+    representation_version: u32,
+    #[serde(default)]
+    embedding_identity: Option<String>,
     records: Vec<IgnoredAny>,
 }
 
@@ -2065,12 +1921,20 @@ struct SemanticDiskCacheSnapshot {
 struct SemanticDiskCacheStatus {
     version: u32,
     fingerprint: u64,
+    representation_version: u32,
+    embedding_identity: Option<String>,
     record_count: usize,
 }
 
 impl SemanticDiskCacheStatus {
-    fn current_for(&self, fingerprint: u64) -> bool {
-        self.version == SEMANTIC_INDEX_FORMAT_VERSION && self.fingerprint == fingerprint
+    /// A snapshot is ready only for the exact model identity. An unknown identity
+    /// (`None`) never matches, so an identity-less snapshot cannot report Ready.
+    fn current_for(&self, fingerprint: u64, identity: Option<&str>) -> bool {
+        self.version == SEMANTIC_INDEX_FORMAT_VERSION
+            && self.representation_version == neuink_search::EMBEDDING_REPRESENTATION_VERSION
+            && self.fingerprint == fingerprint
+            && identity.is_some()
+            && self.embedding_identity.as_deref() == identity
     }
 }
 
@@ -2080,6 +1944,8 @@ fn read_semantic_disk_cache_status(path: &PathBuf) -> Option<SemanticDiskCacheSt
     Some(SemanticDiskCacheStatus {
         version: snapshot.version,
         fingerprint: snapshot.fingerprint,
+        representation_version: snapshot.representation_version,
+        embedding_identity: snapshot.embedding_identity,
         record_count: snapshot.records.len(),
     })
 }

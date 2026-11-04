@@ -3312,6 +3312,7 @@ dependencies = [
 name = "neuink-search"
 version = "0.1.3"
 dependencies = [
+ "blake3",
  "fastembed",
  "neuink-domain",
  "rayon",

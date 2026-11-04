@@ -50,20 +50,30 @@ describe('evidence diversity (MMR)', () => {
 
   it('penalizes a third result from an already crowded section', () => {
     const selected = selectDiverseEvidence([
-      { ...candidate('a', 1, 'alpha one'), sectionPath: 'Methods' },
-      { ...candidate('b', 0.95, 'alpha two'), sectionPath: 'Methods' },
-      { ...candidate('c', 0.9, 'alpha three'), sectionPath: 'Methods' },
-      { ...candidate('d', 0.85, 'results finding'), sectionPath: 'Results' }
+      { ...candidate('a', 1, 'alpha one'), sectionKey: 'paper-a::Methods' },
+      { ...candidate('b', 0.95, 'alpha two'), sectionKey: 'paper-a::Methods' },
+      { ...candidate('c', 0.9, 'alpha three'), sectionKey: 'paper-a::Methods' },
+      { ...candidate('d', 0.85, 'results finding'), sectionKey: 'paper-a::Results' }
     ], 3);
     expect(selected.map((item) => item.key)).toEqual(['a', 'b', 'd']);
   });
 
   it('does not penalize an explicit section filter', () => {
     const selected = selectDiverseEvidence([
-      { ...candidate('a', 1, 'alpha one'), sectionPath: 'Methods' },
-      { ...candidate('b', 0.95, 'alpha two'), sectionPath: 'Methods' },
-      { ...candidate('c', 0.9, 'alpha three'), sectionPath: 'Methods' }
+      { ...candidate('a', 1, 'alpha one'), sectionKey: 'paper-a::Methods' },
+      { ...candidate('b', 0.95, 'alpha two'), sectionKey: 'paper-a::Methods' },
+      { ...candidate('c', 0.9, 'alpha three'), sectionKey: 'paper-a::Methods' }
     ], 3, undefined, { sectionFilter: 'Methods' });
     expect(selected).toHaveLength(3);
+  });
+
+  it('does not crowd out another paper with the same section name', () => {
+    const selected = selectDiverseEvidence([
+      { ...candidate('a', 1, 'alpha one'), sectionKey: 'paper-a::Introduction' },
+      { ...candidate('b', 0.95, 'alpha two'), sectionKey: 'paper-a::Introduction' },
+      { ...candidate('c', 0.9, 'alpha three'), sectionKey: 'paper-b::Introduction' },
+      { ...candidate('d', 0.85, 'results finding'), sectionKey: 'paper-a::Results' }
+    ], 3);
+    expect(selected.map((item) => item.key)).toEqual(['a', 'b', 'c']);
   });
 });
