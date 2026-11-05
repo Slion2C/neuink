@@ -73,11 +73,20 @@ function publishLlmSettings(settings: LlmSettingsState) {
   }
 }
 
+/**
+ * `library`: no selection, the whole library (entry_ids mirrors it for legacy readers only).
+ * `selection`: entry_ids is the exact selected set, possibly empty.
+ * `unresolved`: a referenced Tag or Entry no longer exists; retrieval must ask for clarification.
+ * Absent on snapshots written before this field existed.
+ */
+export type ScopeIntent = 'library' | 'selection' | 'unresolved';
+
 export type ScopeSnapshot = {
   tag_ids: TagId[];
   tag_names: string[];
   entry_ids: EntryId[];
   entry_titles: string[];
+  scope_intent?: ScopeIntent;
 };
 
 export type LocalConversationSourceLink = {

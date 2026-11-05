@@ -74,6 +74,11 @@ pub struct SearchSegmentsRequest {
 
 #[derive(Debug, Deserialize)]
 pub struct SearchSegmentTask {
+    /// Echoed back on the matching batch item so the caller can associate results.
+    #[serde(default)]
+    pub task_id: String,
+    /// Blank queries fail only their own task; see `collect_segments_batch`.
+    #[serde(default)]
     pub query: String,
     #[serde(default)]
     pub english_query: Option<String>,
@@ -95,6 +100,23 @@ pub struct SearchSegmentTask {
 pub struct SearchSegmentsBatchRequest {
     pub root: PathBuf,
     pub tasks: Vec<SearchSegmentTask>,
+}
+
+/// One ordered entry per submitted task. Exactly one of `results` or `error` is set.
+#[derive(Debug, Serialize)]
+pub struct SearchSegmentsBatchItem {
+    pub task_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub results: Option<SearchResults>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<SearchSegmentsTaskError>,
+}
+
+/// Fixed, path-free codes. Raw backend errors can contain workspace paths, so they are dropped.
+#[derive(Debug, Serialize)]
+pub struct SearchSegmentsTaskError {
+    pub code: &'static str,
+    pub message: &'static str,
 }
 
 #[derive(Debug, Deserialize)]
@@ -462,33 +484,26 @@ fn run_search_bundle(
 pub async fn search_segments_batch<R: tauri::Runtime>(
     app: tauri::AppHandle<R>,
     request: SearchSegmentsBatchRequest,
-) -> Result<Vec<SearchResults>, String> {
+) -> Result<Vec<SearchSegmentsBatchItem>, String> {
     let model_dir = embedding_model_dir(&app)?;
     tokio::task::spawn_blocking(move || run_segments_batch(model_dir, request))
         .await
         .map_err(|error| error.to_string())?
 }
 
-/// Prepares the workspace index and embedding provider once, then runs each
-/// task in order against those shared resources. Results follow task order.
+/// Prepares the workspace index and embedding provider once per batch, then runs
+/// each task in order. Only a preparation failure fails the whole batch.
 fn run_segments_batch(
     model_dir: PathBuf,
     request: SearchSegmentsBatchRequest,
-) -> Result<Vec<SearchResults>, String> {
+) -> Result<Vec<SearchSegmentsBatchItem>, String> {
     let SearchSegmentsBatchRequest { root, tasks } = request;
-    if tasks.iter().any(|task| task.query.trim().is_empty()) {
-        return Err("query is required".into());
-    }
-    if tasks.is_empty() {
-        return Ok(Vec::new());
-    }
-    let needs_semantic = tasks.iter().any(|task| task.mode != SearchMode::Keyword);
-    let prepared = prepare_search(model_dir, &root, true, needs_semantic)?;
-    tasks
-        .into_iter()
-        .map(|task| {
+    collect_segments_batch(
+        tasks,
+        |needs_semantic| prepare_search(model_dir, &root, true, needs_semantic),
+        |prepared, task| {
             run_single_query(
-                &prepared,
+                prepared,
                 &task.query,
                 task.english_query.as_deref(),
                 &task.sub_queries,
@@ -499,8 +514,63 @@ fn run_segments_batch(
                 task.section_filter,
                 parse_segment_types(&task.segment_types),
             )
+        },
+    )
+}
+
+const BATCH_INVALID_QUERY: SearchSegmentsTaskError = SearchSegmentsTaskError {
+    code: "invalid_query",
+    message: "query is required",
+};
+const BATCH_SEARCH_FAILED: SearchSegmentsTaskError = SearchSegmentsTaskError {
+    code: "search_failed",
+    message: "search task failed",
+};
+
+/// Generic over the prepared resources so the per-task isolation rules can be tested
+/// without a workspace or embedding model. `prepare` is called at most once.
+fn collect_segments_batch<P>(
+    tasks: Vec<SearchSegmentTask>,
+    prepare: impl FnOnce(bool) -> Result<P, String>,
+    run: impl Fn(&P, SearchSegmentTask) -> Result<SearchResults, String>,
+) -> Result<Vec<SearchSegmentsBatchItem>, String> {
+    let any_valid = tasks.iter().any(|task| !task.query.trim().is_empty());
+    if !any_valid {
+        // Nothing to search: do not open the workspace at all.
+        return Ok(tasks
+            .into_iter()
+            .map(|task| batch_error_item(task.task_id, BATCH_INVALID_QUERY))
+            .collect());
+    }
+    let needs_semantic = tasks
+        .iter()
+        .any(|task| !task.query.trim().is_empty() && task.mode != SearchMode::Keyword);
+    let prepared = prepare(needs_semantic)?;
+    Ok(tasks
+        .into_iter()
+        .map(|task| {
+            if task.query.trim().is_empty() {
+                return batch_error_item(task.task_id, BATCH_INVALID_QUERY);
+            }
+            let task_id = task.task_id.clone();
+            match run(&prepared, task) {
+                Ok(results) => SearchSegmentsBatchItem {
+                    task_id,
+                    results: Some(results),
+                    error: None,
+                },
+                Err(_) => batch_error_item(task_id, BATCH_SEARCH_FAILED),
+            }
         })
-        .collect()
+        .collect())
+}
+
+fn batch_error_item(task_id: String, error: SearchSegmentsTaskError) -> SearchSegmentsBatchItem {
+    SearchSegmentsBatchItem {
+        task_id,
+        results: None,
+        error: Some(error),
+    }
 }
 
 // Updated only from the frozen selection and independent gate report.
@@ -1742,19 +1812,21 @@ use neuink_search::SearchEntryGroup;
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, time::SystemTime};
+    use std::{fs, sync::Arc, time::SystemTime};
 
     use super::{
         begin_search_build, filter_segment_search_results, load_search_build_status,
-        lookup_semantic_memory, model_semantic_cache_key, records_fingerprint,
-        search_build_status_path, search_scope_options, semantic_cache_namespace,
-        update_search_build_progress, SearchIndexBuildState, SearchIndexBuildStatus,
-        WorkspaceSearchRecord, WorkspaceSearchRecordKind,
+        lookup_semantic_memory, model_semantic_cache_key, parse_segment_types, records_fingerprint,
+        run_single_query, search_build_status_path, search_document, search_scope_options,
+        semantic_cache_namespace, update_search_build_progress, PreparedSearch,
+        SearchIndexBuildState, SearchIndexBuildStatus, WorkspaceSearchRecord,
+        WorkspaceSearchRecordKind,
     };
-    use neuink_domain::EntryId;
+    use neuink_domain::{EntryId, SegmentType, SegmentUid};
     use neuink_search::{
-        SearchDocumentSource, SearchDocumentSourceKind, SearchEntryGroup, SearchHit, SearchInclude,
-        SearchResults, SearchTarget,
+        FastEmbedProvider, MemorySearchIndex, SearchDocumentSource, SearchDocumentSourceKind,
+        SearchEntryGroup, SearchHit, SearchInclude, SearchIndex, SearchMode, SearchResults,
+        SearchTarget,
     };
     use neuink_workspace::WorkspaceSearchOptions;
 
@@ -2013,36 +2085,378 @@ mod tests {
         }
     }
 
+    fn batch_task(task_id: &str, query: &str, mode: super::SearchMode) -> super::SearchSegmentTask {
+        super::SearchSegmentTask {
+            task_id: task_id.to_string(),
+            query: query.to_string(),
+            english_query: None,
+            sub_queries: Vec::new(),
+            section_filter: None,
+            segment_types: Vec::new(),
+            scope_entry_ids: Vec::new(),
+            mode,
+            top_k: None,
+        }
+    }
+
+    fn empty_results(query: &str) -> SearchResults {
+        SearchResults {
+            query: query.to_string(),
+            mode: "keyword".to_string(),
+            index_generation: 0,
+            total_hit_count: 0,
+            entries: Vec::new(),
+            warnings: Vec::new(),
+        }
+    }
+
     #[test]
-    fn segments_batch_rejects_any_blank_query_before_opening_workspace() {
-        let request = super::SearchSegmentsBatchRequest {
-            root: std::path::PathBuf::from("workspace-that-does-not-exist"),
-            tasks: vec![
-                super::SearchSegmentTask {
-                    query: "valid".to_string(),
-                    english_query: None,
-                    sub_queries: Vec::new(),
-                    section_filter: None,
-                    segment_types: Vec::new(),
-                    scope_entry_ids: Vec::new(),
-                    mode: Default::default(),
-                    top_k: None,
-                },
-                super::SearchSegmentTask {
-                    query: "   ".to_string(),
-                    english_query: None,
-                    sub_queries: Vec::new(),
-                    section_filter: None,
-                    segment_types: Vec::new(),
-                    scope_entry_ids: Vec::new(),
-                    mode: Default::default(),
-                    top_k: None,
-                },
+    fn segments_batch_without_valid_queries_never_prepares_resources() {
+        let prepare_calls = std::cell::Cell::new(0);
+        let items = super::collect_segments_batch(
+            vec![
+                batch_task("t1", "   ", SearchMode::Hybrid),
+                batch_task("t2", "", SearchMode::Keyword),
             ],
+            |_| {
+                prepare_calls.set(prepare_calls.get() + 1);
+                Ok(())
+            },
+            |_: &(), _| Ok(empty_results("unused")),
+        )
+        .expect("blank-only batch returns per-task errors");
+        assert_eq!(prepare_calls.get(), 0);
+        assert_eq!(items.len(), 2);
+        assert!(items.iter().all(|item| item.results.is_none()
+            && item
+                .error
+                .as_ref()
+                .is_some_and(|error| error.code == "invalid_query")));
+        assert_eq!(items[0].task_id, "t1");
+        assert_eq!(items[1].task_id, "t2");
+    }
+
+    #[test]
+    fn segments_batch_prepares_once_and_isolates_bad_tasks_in_order() {
+        let prepare_calls = std::cell::Cell::new(0);
+        let items = super::collect_segments_batch(
+            vec![
+                batch_task("first", "alpha", SearchMode::Hybrid),
+                batch_task("blank", "  ", SearchMode::Hybrid),
+                batch_task("broken", "broken", SearchMode::Hybrid),
+                batch_task("last", "gamma", SearchMode::Hybrid),
+            ],
+            |needs_semantic| {
+                prepare_calls.set(prepare_calls.get() + 1);
+                assert!(needs_semantic);
+                Ok(())
+            },
+            |_: &(), task| {
+                if task.query == "broken" {
+                    Err("index detail that must not leak".to_string())
+                } else {
+                    Ok(empty_results(&task.query))
+                }
+            },
+        )
+        .expect("per-task failures do not fail the batch");
+        assert_eq!(prepare_calls.get(), 1);
+        let ids: Vec<&str> = items.iter().map(|item| item.task_id.as_str()).collect();
+        assert_eq!(ids, ["first", "blank", "broken", "last"]);
+        assert_eq!(
+            items[0].results.as_ref().map(|r| r.query.as_str()),
+            Some("alpha")
+        );
+        assert_eq!(
+            items[1].error.as_ref().map(|e| e.code),
+            Some("invalid_query")
+        );
+        assert_eq!(
+            items[2].error.as_ref().map(|e| e.code),
+            Some("search_failed")
+        );
+        assert_eq!(
+            items[2].error.as_ref().map(|e| e.message),
+            Some("search task failed")
+        );
+        assert_eq!(
+            items[3].results.as_ref().map(|r| r.query.as_str()),
+            Some("gamma")
+        );
+    }
+
+    #[test]
+    fn segments_batch_requests_semantic_preparation_only_for_non_keyword_tasks() {
+        let needs = std::cell::Cell::new(None);
+        super::collect_segments_batch(
+            vec![batch_task("k", "alpha", SearchMode::Keyword)],
+            |needs_semantic| {
+                needs.set(Some(needs_semantic));
+                Ok(())
+            },
+            |_: &(), task| Ok(empty_results(&task.query)),
+        )
+        .expect("keyword batch succeeds");
+        assert_eq!(needs.get(), Some(false));
+    }
+
+    #[test]
+    fn segments_batch_preparation_failure_fails_the_whole_batch() {
+        let error = super::collect_segments_batch(
+            vec![batch_task("t1", "alpha", SearchMode::Hybrid)],
+            |_| Err::<(), _>("workspace unavailable".to_string()),
+            |_: &(), task| Ok(empty_results(&task.query)),
+        )
+        .expect_err("index preparation failure aborts the batch");
+        assert_eq!(error, "workspace unavailable");
+    }
+
+    fn parity_segment(
+        entry_id: &str,
+        segment_uid: &str,
+        page_idx: u32,
+        segment_type: SegmentType,
+        section_path: &str,
+        text: &str,
+    ) -> WorkspaceSearchRecord {
+        WorkspaceSearchRecord {
+            entry_id: EntryId::from_string(entry_id.to_string()),
+            entry_title: entry_id.to_string(),
+            kind: WorkspaceSearchRecordKind::Segment,
+            // The segment uid doubles as the title so each hit can be identified by its title.
+            title: segment_uid.to_string(),
+            text: text.to_string(),
+            field_name: None,
+            tag_id: None,
+            tag_path: None,
+            note_id: None,
+            segment_uid: Some(SegmentUid::from_string(segment_uid.to_string())),
+            page_idx: Some(page_idx),
+            segment_type: Some(segment_type),
+            section_id: None,
+            section_path: Some(section_path.to_string()),
+            section_role: None,
+            caption: None,
+            translation: None,
+        }
+    }
+
+    /// Keyword-only segment fixture. The embedding model directory does not exist and no
+    /// semantic index is attached, so hybrid tasks take the keyword fallback path.
+    fn parity_prepared() -> PreparedSearch {
+        let records = vec![
+            parity_segment(
+                "paper-a",
+                "a-intro",
+                0,
+                SegmentType::Paragraph,
+                "Introduction",
+                "contrastive pretraining improves recall on the benchmark corpus",
+            ),
+            parity_segment(
+                "paper-a",
+                "a-table",
+                3,
+                SegmentType::Table,
+                "Results > Table 2",
+                "benchmark recall table reports contrastive results",
+            ),
+            parity_segment(
+                "paper-b",
+                "b-method",
+                1,
+                SegmentType::Paragraph,
+                "Methods > Dataset",
+                "contrastive pretraining reduces latency on the benchmark corpus",
+            ),
+            parity_segment(
+                "paper-b",
+                "b-results",
+                2,
+                SegmentType::Paragraph,
+                "Results > Ablation",
+                "ablation shows latency gains for the retrieval encoder",
+            ),
+        ];
+        let index = Arc::new(MemorySearchIndex::default());
+        index
+            .replace_documents(records.into_iter().filter_map(search_document).collect())
+            .expect("index segment fixtures");
+        let (_, include) = search_scope_options(true);
+        let model_dir = std::env::temp_dir().join(format!(
+            "neuink-search-parity-missing-model-{}",
+            std::process::id()
+        ));
+        PreparedSearch {
+            include,
+            keyword: index,
+            provider: Arc::new(FastEmbedProvider::from_model_dir(model_dir)),
+            semantic: None,
+        }
+    }
+
+    fn parity_tasks() -> Vec<super::SearchSegmentTask> {
+        let mut english = batch_task("english", "benchmark", SearchMode::Keyword);
+        english.english_query = Some("contrastive pretraining".to_string());
+        english.sub_queries = vec!["latency".to_string()];
+        let mut scoped = batch_task("scoped", "contrastive", SearchMode::Keyword);
+        scoped.scope_entry_ids = vec![EntryId::from_string("paper-b".to_string())];
+        let mut section = batch_task("section", "benchmark", SearchMode::Keyword);
+        section.section_filter = Some("Results".to_string());
+        let mut table = batch_task("table", "benchmark", SearchMode::Keyword);
+        table.segment_types = vec!["table".to_string()];
+        vec![
+            batch_task("keyword", "contrastive", SearchMode::Keyword),
+            batch_task("hybrid", "benchmark recall", SearchMode::Hybrid),
+            english,
+            scoped,
+            section,
+            table,
+            batch_task("blank", "   ", SearchMode::Hybrid),
+        ]
+    }
+
+    /// Mirrors the per-task mapping in `run_segments_batch` so the direct and batched paths
+    /// share one set of query arguments.
+    fn run_parity_task(
+        prepared: &PreparedSearch,
+        task: super::SearchSegmentTask,
+    ) -> Result<SearchResults, String> {
+        run_single_query(
+            prepared,
+            &task.query,
+            task.english_query.as_deref(),
+            &task.sub_queries,
+            task.scope_entry_ids,
+            task.mode,
+            task.top_k.unwrap_or(20).clamp(1, 20),
+            true,
+            task.section_filter,
+            parse_segment_types(&task.segment_types),
+        )
+    }
+
+    fn hit_titles(results: &SearchResults) -> Vec<String> {
+        results
+            .entries
+            .iter()
+            .flat_map(|group| group.hits.iter().map(|hit| hit.title.clone()))
+            .collect()
+    }
+
+    fn hit_entry_ids(results: &SearchResults) -> Vec<String> {
+        results
+            .entries
+            .iter()
+            .flat_map(|group| {
+                group
+                    .hits
+                    .iter()
+                    .map(|hit| hit.entry_id.as_str().to_string())
+            })
+            .collect()
+    }
+
+    /// Hits are ranked inside each entry group; the groups themselves are not flattened into one ranking.
+    fn assert_hits_ranked_within_entries(results: &SearchResults) {
+        for group in &results.entries {
+            let scores: Vec<f32> = group.hits.iter().map(|hit| hit.score).collect();
+            assert!(
+                scores.windows(2).all(|pair| pair[0] >= pair[1]),
+                "scores out of order in {}: {scores:?}",
+                group.entry_id.as_str()
+            );
+        }
+    }
+
+    #[test]
+    fn segments_batch_matches_direct_queries_on_the_same_prepared_index() {
+        let prepared = parity_prepared();
+        let direct: Vec<(String, serde_json::Value)> = parity_tasks()
+            .into_iter()
+            .filter(|task| !task.query.trim().is_empty())
+            .map(|task| {
+                let task_id = task.task_id.clone();
+                let results = run_parity_task(&prepared, task).expect("direct query succeeds");
+                (
+                    task_id,
+                    serde_json::to_value(results).expect("serialize direct results"),
+                )
+            })
+            .collect();
+        let items = super::collect_segments_batch(
+            parity_tasks(),
+            move |_| Ok(prepared),
+            |prepared, task| run_parity_task(prepared, task),
+        )
+        .expect("prepared batch runs");
+
+        let ids: Vec<&str> = items.iter().map(|item| item.task_id.as_str()).collect();
+        assert_eq!(
+            ids,
+            ["keyword", "hybrid", "english", "scoped", "section", "table", "blank"]
+        );
+        let blank = items.last().expect("blank task item");
+        assert!(blank.results.is_none());
+        assert_eq!(
+            blank.error.as_ref().map(|error| error.code),
+            Some("invalid_query")
+        );
+        let batched: Vec<(String, serde_json::Value)> = items
+            .iter()
+            .filter_map(|item| {
+                item.results.as_ref().map(|results| {
+                    (
+                        item.task_id.clone(),
+                        serde_json::to_value(results).expect("serialize batch results"),
+                    )
+                })
+            })
+            .collect();
+        assert_eq!(batched, direct);
+    }
+
+    #[test]
+    fn segments_batch_results_hold_expected_hits_modes_and_warnings() {
+        let prepared = parity_prepared();
+        let items = super::collect_segments_batch(
+            parity_tasks(),
+            move |_| Ok(prepared),
+            |prepared, task| run_parity_task(prepared, task),
+        )
+        .expect("prepared batch runs");
+        let result = |task_id: &str| {
+            items
+                .iter()
+                .find(|item| item.task_id == task_id)
+                .and_then(|item| item.results.as_ref())
+                .unwrap_or_else(|| panic!("task {task_id} has results"))
         };
-        let error = super::run_segments_batch(std::path::PathBuf::from("model"), request)
-            .expect_err("blank query must be rejected");
-        assert_eq!(error, "query is required");
+
+        let keyword = result("keyword");
+        assert_eq!(keyword.mode, "keyword");
+        assert!(keyword.warnings.is_empty());
+        assert!(!hit_titles(keyword).is_empty());
+        assert!(hit_titles(keyword)
+            .iter()
+            .all(|title| ["a-intro", "a-table", "b-method"].contains(&title.as_str())));
+        assert_hits_ranked_within_entries(keyword);
+
+        let hybrid = result("hybrid");
+        assert_eq!(hybrid.mode, "hybrid_fallback_keyword");
+        assert!(!hybrid.warnings.is_empty());
+        assert!(!hit_titles(hybrid).is_empty());
+
+        let english = result("english");
+        assert!(hit_titles(english).iter().any(|title| title == "b-method"));
+        assert!(hit_titles(english).iter().any(|title| title == "b-results"));
+
+        let scoped = result("scoped");
+        assert!(!hit_titles(scoped).is_empty());
+        assert!(hit_entry_ids(scoped).iter().all(|entry| entry == "paper-b"));
+
+        assert_eq!(hit_titles(result("section")), ["a-table"]);
+        assert_eq!(hit_titles(result("table")), ["a-table"]);
     }
 
     fn record(entry_id: &str, text: &str) -> WorkspaceSearchRecord {

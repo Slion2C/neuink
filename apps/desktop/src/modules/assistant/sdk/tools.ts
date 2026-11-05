@@ -5,7 +5,7 @@ import { assertResearchRetry } from './researchRecovery';
 import { buildDiagramArtifact } from './diagramArtifact';
 import { createBrowserTabTool } from './browserTabTool';
 import type { BrowserTabTarget } from '@/shared/ipc/browserApi';
-import { assertSuccessfulToolResult, safeToolErrorEvent, toolPreflight, trackToolFailures, ToolPreconditionError } from './toolFailurePolicy';
+import { safeToolErrorEvent, toolPreflight, trackToolFailures, ToolPreconditionError } from './toolFailurePolicy';
 import { createAgentToolFailure, isAgentToolFailure } from '../agent-core/toolFailure';
 import { AgentLocalLimitError, AgentStoppedError } from '../agent-core/agent';
 
@@ -19,7 +19,6 @@ import type {
   ReadSegmentContentResponse,
   ScopeSnapshot
 } from '@/shared/ipc/assistantApi';
-import { invokeAssistantTool } from '@/shared/ipc/assistantApi';
 import type {
   AgentInvocationPlan,
   AssistantActiveNote,
@@ -34,7 +33,7 @@ import type {
   AssistantTagProposal,
   AssistantTaskPlan
 } from '@/shared/types/assistant';
-import { readNote, type SearchResults } from '@/shared/ipc/workspaceApi';
+import { readNote } from '@/shared/ipc/workspaceApi';
 
 import {
   asObject,
@@ -45,7 +44,6 @@ import {
   entryIdOrSingleScope,
   errorMessage,
   executeTool,
-  formatSearchSegmentsOutput,
   mcpToolIdsForAgent,
   modelInputSchema,
   modelToolName,
@@ -87,7 +85,9 @@ import { SourceLedger } from '../runtime/sourceLedger';
 import type { ApplicationActions } from '../runtime/applicationActions';
 import { resolveModelProfile, runJsonModelTask } from './modelTasks';
 import { PLANNER_TASK_DESCRIPTION, PLANNER_TASK_NAME, fallbackDirectPlan, planRetrieval, type PlanResolution } from './retrievalPlanning';
-import { runSearchLibrary } from './searchLibrary';
+import { runSearchLibrary, type PlanInput, type SearchOptions } from './searchLibrary';
+import { createSearchLibraryBatch } from './searchLibraryBatch';
+import { frozenScopeFromSnapshot, scopeRequestFromToolInput } from './searchScope';
 import { PLANNING_READ_TOOLS } from '../runtime/executionPolicy';
 import { buildEntryMetaProposal } from './entryMetaProposal';
 import {
@@ -146,6 +146,29 @@ function isAllowedMcpTool(
   return activeExecution?.agent.allowedMcpServerIds?.includes(serverId) ?? false;
 }
 
+/** Optional retrieval options the model supplies once; every sub-question inherits them. */
+/** Cancellation from the model call and from the run. Either one stops the search. */
+function combinedAbortSignal(...signals: Array<AbortSignal | undefined>): AbortSignal | undefined {
+  const present = signals.filter((signal): signal is AbortSignal => signal !== undefined);
+  return present.length > 1 ? AbortSignal.any(present) : present[0];
+}
+
+const SEARCH_LIBRARY_FAILED_COPY = '资料库检索失败，本次未返回证据。';
+
+/** Without a host-built retrieval scope, `search_library` asks for clarification. It never falls back to the legacy scope. */
+const UNRESOLVED_RETRIEVAL_SCOPE: ScopeSnapshot = {
+  tag_ids: [], tag_names: [], entry_ids: [], entry_titles: [], scope_intent: 'unresolved'
+};
+
+function searchLibraryOptions(object: JsonObject): SearchOptions {
+  return {
+    english_query: optionalString(object.english_query) ?? undefined,
+    sub_queries: stringArray(object.sub_queries).slice(0, 3),
+    section_filter: optionalString(object.section_filter) ?? undefined,
+    segment_types: stringArray(object.segment_types)
+  };
+}
+
 type ToolEventHandler = (event: AssistantToolTraceEvent) => void;
 type NoteProposalHandler = (proposal: AssistantNoteProposal) => void;
 type EntryMetaProposalHandler = (proposal: AssistantEntryMetaProposal) => void;
@@ -185,6 +208,8 @@ type CreateAssistantToolsOptions = {
   profiles?: LlmProfile[];
   invocationPlan?: AgentInvocationPlan | null;
   plan?: AssistantTaskPlan;
+  /** Explicit scope that `search_library` may search. Legacy `scope` is never used for retrieval. */
+  retrievalScope?: ScopeSnapshot;
   root: string;
   runtimeSettings?: AgentRuntimeSettings | null;
   scope: ScopeSnapshot;
@@ -252,6 +277,7 @@ export async function createAssistantTools({
   profiles = [],
   invocationPlan,
   plan,
+  retrievalScope,
   root,
   runtimeSettings,
   scope
@@ -646,38 +672,49 @@ export async function createAssistantTools({
   }
 
   if (enabledToolIds.has('search_library')) {
-    const planSearch = async (question: string, scopeHint: string): Promise<PlanResolution> => {
+    const planSearch = async (input: PlanInput): Promise<PlanResolution> => {
       let profile: LlmProfile;
       try {
         profile = resolveModelProfile(null, profiles, defaultProfile);
       } catch {
-        return fallbackDirectPlan(question, 'no_model_configured');
+        return fallbackDirectPlan(input.question, 'no_model_configured');
       }
       const runModel = async (system: string, prompt: string) =>
         runJsonModelTask({
           budget,
-          abortSignal,
+          abortSignal: input.abortSignal,
           settings: profile,
           name: PLANNER_TASK_NAME,
           description: PLANNER_TASK_DESCRIPTION,
           system,
           prompt
         });
-      return planRetrieval({ question, scopeHint, runModel });
+      return planRetrieval({
+        question: input.question,
+        scopeHint: input.scopeHint,
+        papers: input.papers,
+        libraryScope: input.libraryScope,
+        runModel,
+        abortSignal: input.abortSignal
+      });
     };
 
     tools.search_library = tool<unknown, unknown>({
       description:
-        'Search the library for evidence answering a question. With use_planning true, decompose multi-target or cross-paper questions and report per-sub-question coverage; otherwise retrieve the original question directly. Returns evidence grouped by sub-question plus coverage and any planning degradation.',
+        'Search the library for evidence answering a question. Planning is on by default: the planner may split multi-target or cross-paper questions into per-paper sub-questions. Returns evidence per sub-question with each task status (retrieved, empty, or failed) and any planning degradation. Retrieval status does not show that the answer is complete.',
       inputSchema: jsonSchema<unknown>({
         type: 'object',
         additionalProperties: false,
         required: ['question'],
         properties: {
           question: { type: 'string', description: 'The question to search for.' },
-          scope_entry_ids: { type: 'array', items: { type: 'string' }, description: 'Optional Entry ids; omit for the full library or the frozen scope.' },
-          use_planning: { type: 'boolean', description: 'Optional; decompose multi-target or cross-paper questions with the configured model.' },
-          top_k: { type: 'integer', minimum: 1, maximum: 12, description: 'Optional maximum segment hits per sub-question.' }
+          scope_entry_ids: { type: 'array', items: { type: 'string' }, description: 'Optional Entry ids; omit for the current scope. An empty array searches nothing.' },
+          use_planning: { type: 'boolean', description: 'Optional; set false to search the original question directly without planning.' },
+          top_k: { type: 'integer', minimum: 1, maximum: 12, description: 'Optional maximum segment hits per sub-question.' },
+          english_query: { type: 'string', description: 'Optional English academic query for the original question, for a Chinese question about English papers.' },
+          sub_queries: { type: 'array', items: { type: 'string' }, maxItems: 3, description: 'Optional additional focused queries, at most three, applied to every sub-question.' },
+          section_filter: { type: 'string', description: 'Optional section id or section path fragment.' },
+          segment_types: { type: 'array', items: { type: 'string' }, description: 'Optional segment types such as paragraph, table, figure, math, or heading.' }
         }
       } as JSONSchema7),
       execute: async (input, options) => {
@@ -686,43 +723,41 @@ export async function createAssistantTools({
         try {
           const object = asObject(input);
           const question = toolPreflight(() => requiredString(object.question, 'question'));
-          const scopeEntryIds = object.scope_entry_ids == null ? null : stringArray(object.scope_entry_ids);
-          const usePlanning = object.use_planning === true;
+          const scopeRequest = toolPreflight(() => scopeRequestFromToolInput(object.scope_entry_ids));
+          // Planning is the default. Only an explicit boolean false turns it off.
+          const usePlanning = object.use_planning !== false;
           const topK = clampTopK(object.top_k);
+          const searchOptions = searchLibraryOptions(object);
+          // Keep absent scope (null) distinct from an explicit empty scope ([]) and every option.
           fingerprint = loopGuard?.beforeToolCall('search_library', {
             question,
-            scope_entry_ids: scopeEntryIds ?? [],
-            use_planning: usePlanning
+            scope_entry_ids: object.scope_entry_ids ?? null,
+            use_planning: usePlanning,
+            top_k: topK,
+            options: searchOptions
           });
           emit({
             id: toolCallId,
-            input: publicInput({ question, scope_entry_ids: scopeEntryIds ?? [], use_planning: usePlanning, top_k: topK }),
+            input: publicInput({ question, use_planning: usePlanning, top_k: topK }),
             status: 'running',
             summary: '正在检索资料库…',
             toolName: 'search_library'
           });
+          // Planner calls and batch searches stop on the model-call signal or the run signal.
+          const searchSignal = combinedAbortSignal(options.abortSignal, abortSignal);
           const result = await runSearchLibrary({
             question,
-            scopeEntryIds,
+            scopeRequest,
             usePlanning,
             topK,
-            frozenEntryIds: scope.entry_ids,
+            options: searchOptions,
+            frozenScope: frozenScopeFromSnapshot(retrievalScope ?? UNRESOLVED_RETRIEVAL_SCOPE),
+            libraryEntries: availableEntries.map((entry) => ({ id: entry.id, title: entry.title })),
             plan: planSearch,
-            search: async (task, scopeIds, k) => {
-              const results = await invokeAssistantTool<SearchResults>('search_segments', {
-                root,
-                query: task.question,
-                mode: 'hybrid',
-                scope_entry_ids: scopeIds,
-                top_k: k
-              });
-              assertSuccessfulToolResult(results);
-              const formatted = formatSearchSegmentsOutput(results, addSource, null);
-              return { evidence: formatted.modelOutput.evidence, sources: formatted.sources };
-            },
-            abortSignal: options.abortSignal ?? abortSignal
+            searchBatch: createSearchLibraryBatch({ root, addSource, abortSignal: searchSignal }),
+            abortSignal: searchSignal
           });
-          (options.abortSignal ?? abortSignal)?.throwIfAborted();
+          searchSignal?.throwIfAborted();
           observations.push({ output: result.modelOutput, toolName: 'search_library' });
           loopGuard?.recordSuccess(result.modelOutput);
           emit({
@@ -736,10 +771,10 @@ export async function createAssistantTools({
           return result.modelOutput;
         } catch (error) {
           if (fingerprint) loopGuard?.recordFailure(fingerprint);
+          // Raw provider, root and input text stay out of the trace. Cancellation and quota stops still propagate.
           emit({
-            error: errorMessage(error),
+            error: SEARCH_LIBRARY_FAILED_COPY,
             id: toolCallId,
-            input,
             status: 'error',
             toolName: 'search_library'
           });
@@ -929,6 +964,7 @@ export async function createAssistantTools({
             currentNote,
             instruction,
             question: optionalString(object.question) ?? instruction,
+            retrievalScope: retrievalScope ?? UNRESOLVED_RETRIEVAL_SCOPE,
             root,
             runtimeSettings,
             scope,

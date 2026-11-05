@@ -133,4 +133,91 @@ describe('prompts', () => {
     expect(prompt).toContain('single entry');
     expect(PLANNER_SYSTEM_PROMPT).toContain('single');
   });
+
+  it('lists selected papers for binding but never a whole library', () => {
+    const prompt = buildPlannerPrompt({
+      question: 'Q',
+      scopeHint: 'explicit_multi: 2 entries',
+      papers: [{ id: 'a', title: 'Paper A' }, { id: 'b', title: 'Paper B' }]
+    });
+    expect(prompt).toContain('- a: Paper A');
+    expect(prompt).toContain('- b: Paper B');
+    const library = buildPlannerPrompt({ question: 'Q', libraryScope: true });
+    expect(library).toContain('whole library');
+    expect(library).not.toContain('- ');
+  });
+
+  it('withholds the paper list above the planner cap and reports only the count', () => {
+    const papers = Array.from({ length: 41 }, (_, index) => ({ id: `id-${index}`, title: `Paper ${index}` }));
+    const prompt = buildPlannerPrompt({ question: 'Q', scopeHint: 'x', papers });
+    expect(prompt).toContain('41 papers are in scope');
+    expect(prompt).not.toContain('id-0');
+  });
+});
+
+describe('host question and task binding', () => {
+  const hostQuestion = '论文 A 用了什么方法？';
+
+  it('rejects a plan whose original_question differs from the host question', () => {
+    const result = validatePlanningOutput({ ...multiTargetPlan, original_question: '论文 A 的方法是哪一种？' }, hostQuestion);
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.issues.join(' ')).toContain('repeat the frozen user question exactly');
+  });
+
+  it('returns the host question as the plan original_question when it matches', () => {
+    const result = validatePlanningOutput({ ...multiTargetPlan, original_question: `  ${hostQuestion}  ` }, `  ${hostQuestion}  `);
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(result.plan.original_question).toBe(hostQuestion);
+  });
+
+  it('accepts per-task English queries, paper bindings, and unresolved targets', () => {
+    const result = validatePlanningOutput({
+      ...multiTargetPlan,
+      original_question: hostQuestion,
+      retrieval_tasks: [
+        { id: 'q1', question: '方法？', english_query: 'method', target_entry_ids: ['a'] },
+        { id: 'q2', question: '数据集？' }
+      ],
+      unresolved_targets: ['Paper Z']
+    }, hostQuestion);
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.plan.retrieval_tasks[0]).toMatchObject({ english_query: 'method', target_entry_ids: ['a'] });
+      expect(result.plan.retrieval_tasks[1].target_entry_ids).toEqual([]);
+      expect(result.plan.unresolved_targets).toEqual(['Paper Z']);
+    }
+  });
+
+  it('retries once with feedback when the model rewrites the question, then degrades to the host question', async () => {
+    const runModel = vi.fn(async () => ({ ...multiTargetPlan, original_question: 'rewritten' }));
+    const result = await planRetrieval({ question: hostQuestion, runModel });
+    expect(runModel).toHaveBeenCalledTimes(2);
+    expect(result.status).toBe('degraded');
+    if (result.status === 'degraded') {
+      expect(result.reason).toBe('plan_invalid');
+      expect(result.plan.original_question).toBe(hostQuestion);
+      expect(result.plan.retrieval_tasks).toEqual([]);
+    }
+  });
+
+  it('degrades as model_unavailable at once on a provider failure, without feeding the raw message back', async () => {
+    const runModel = vi.fn(async () => {
+      throw new Error('provider 401 secret-token-value');
+    });
+    const result = await planRetrieval({ question: hostQuestion, runModel });
+    expect(runModel).toHaveBeenCalledTimes(1);
+    expect(result.status).toBe('degraded');
+    if (result.status === 'degraded') expect(result.reason).toBe('model_unavailable');
+    expect(JSON.stringify(result)).not.toContain('secret-token-value');
+  });
+
+  it('propagates an abort instead of degrading', async () => {
+    const controller = new AbortController();
+    const runModel = vi.fn(async () => {
+      controller.abort();
+      throw new DOMException('stopped', 'AbortError');
+    });
+    await expect(planRetrieval({ question: hostQuestion, runModel, abortSignal: controller.signal })).rejects.toThrow();
+    expect(runModel).toHaveBeenCalledTimes(1);
+  });
 });

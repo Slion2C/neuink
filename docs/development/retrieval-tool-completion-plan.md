@@ -32,7 +32,7 @@ search_library(question, 可选范围) → 论文、证据、来源、覆盖状�
 - [DAPR，ACL 2024 主会](https://aclanthology.org/2024.acl-long.236/)：参考片段检索中的文档上下文；评估标题和章节路径对片段识别的影响。
 - [Neuink 检索入口](https://github.com/Slion2C/neuink/blob/f986096/crates/neuink-ipc/src/commands/search.rs)、[检索管线](https://github.com/Slion2C/neuink/blob/f986096/crates/neuink-search/src/retrieval_pipeline.rs)、[助手工具](https://github.com/Slion2C/neuink/blob/f986096/apps/desktop/src/modules/assistant/sdk/toolSupport.ts)。
 
-当前 Neuink 已有 BM25、本地 E5、多查询融合、章节元数据、来源定位和助手侧 MMR；英文查询与子查询主要由外部助手提供，统一工具内部尚无独立规划器。当前生产默认策略为 Legacy、章节重排 alpha=0。本计划不声称已经实现 BookRAG 的实体图或图推理。
+当前 Neuink 已有 BM25、本地 E5、多查询融合、章节元数据、来源定位和助手侧 MMR；英文查询与子查询主要由外部助手提供，统一工具内部已实现规划器（见第 8 节），其分类与拆解质量尚未评估。当前生产默认策略为 Legacy、章节重排 alpha=0。本计划不声称已经实现 BookRAG 的实体图或图推理。
 
 ## 3. 目标流程
 
@@ -181,3 +181,45 @@ flowchart TD
 3. 工具内部分类和按需拆解，并通过现有管线执行。
 4. 对照评测报告与默认策略决策。
 5. 后续交付全库论文发现、逐篇证据补全及覆盖报告。
+
+## 8. 当前实现状态与测试边界
+
+已实现（前端与 Rust 批量接口）：
+
+- `search_library` 接入默认主助手与证据子代理授权（能力修订版 5）。迁移按修订逐步进行：每个工具记录加入的修订版（研究工具 1、PDF 2、浏览器 3、目录 4、`search_library` 5），旧授权只与当时已有的默认工具集合比较，完整者补齐，被限制者保持不变。`use_planning` 默认开启，仅显式 `false` 关闭。
+- 检索范围由宿主 `retrievalRunScope` 从本次的当前选择、消息内 @ 提及和附加上下文构建，作为单独的 `retrievalScope` 传给工具；旧的合并范围 `scope` 仍用于历史与提示，不参与检索。历史会话范围不能扩大或缩小本次检索。显式空标签保持为空，附加论文不会把它变成其他论文集合；单标签结果报告为 `explicit_tag`。缺少 `retrievalScope` 时工具要求澄清，不回退到旧范围。
+- 执行检查点保存冻结的 `retrievalScope`。恢复任务时只使用原始输入中的范围，不继承恢复时传入的当前范围。旧检查点缺少该字段时，`search_library` 按未解析范围要求澄清，旧的 `scope` 保持已保存内容。
+- 范围带有显式 `scope_intent`（library / selection / unresolved）。无选择为全库；空标签或显式 `[]` 不检索；旧快照中带 `tag_ids` 但 `entry_ids` 为空的，仍按空标签处理。条目已不在资料库中、超出冻结范围或标签未知时，返回 `status: needs_clarification`；显式空范围返回 `status: empty_scope`，二者不混淆。Rust 持久化结构新增可选字段 `scope_intent`。
+- 规划输出必须逐字复述宿主问题，否则重试一次后直接回退原问题。提供商错误记为 `model_unavailable`。中止信号（模型调用信号与本次运行信号合并）与 `AgentStoppedError`（含预算与配额停止）立即向外传播，不降级。
+- 规划给出无法绑定的论文名（`unresolved_targets`）时，本次返回 `needs_clarification`，不发起任何批量检索，也不回退为全库直接检索。
+- 批量检索先按各子问题允许的条目过滤原始命中，再格式化并登记来源，越界结果不产生来源标记。取消后批量调用立即拒绝，原生调用之后返回的结果被忽略，不再登记来源。
+- 工具错误轨迹只使用固定文案，不包含原始错误、根路径或原始输入。
+- 规划器约束必须写入每个子问题文本，因为检索只使用子问题文本；`constraints` 字段仅作记录。
+- 带依赖或依赖型多跳的计划只执行一次原问题检索，不模拟依赖执行。
+- 每个子问题可绑定到已选论文（`target_entry_ids`），绑定只能指向范围内的论文。规划器只接收已选论文的元数据，不接收整个资料库。
+- 任务状态为 `retrieved` / `empty` / `failed`，语义充分性固定为 `not_evaluated`。
+- 所有子问题通过一次 `search_segments_batch` 调用执行，后端每批只准备一次索引。单个任务失败不影响其他任务。
+
+测试边界：
+
+- 前端：`searchLibrary`、`searchLibraryHost`、`searchScope`、`retrievalPlanning`、`searchLibraryBatch`、`tools`、`assistantScope`、`retrievalRunScope`、`agentRuntimeSettings` 的单元与接线测试，使用注入的假批量函数，不依赖外部评测语料。`retrievalRunScope` 用例覆盖全库加附加论文、历史全库加空标签、当前 A 加历史 B、旧快照空标签等宿主运行路径。迁移测试覆盖修订 0、1、3 的历史完整集合与被限制的授权。
+- Rust：批量收集逻辑（`collect_segments_batch`）的隔离、顺序、一次准备及准备失败测试，使用注入的假准备与执行函数。新增逐项一致性测试：用内存索引与片段记录构造 `PreparedSearch`（嵌入模型目录不存在，无语义索引，混合任务走关键词回退），对同一准备结果分别直接调用 `run_single_query` 与经 `collect_segments_batch` 调用，比较序列化结果；覆盖关键词、混合回退、英文与子查询、单篇范围、章节过滤和片段类型过滤，并断言命中、模式与警告。`ScopeSnapshot` 的 `scope_intent` 序列化往返与旧快照缺字段测试，以及会话文件中 `scope_intent` 的持久化往返测试。检查点的 `retrievalScope` 冻结与旧检查点回退由前端 `durableHarness` 测试覆盖。复核已通过：底层搜索 52 项、搜索 IPC 15 项、会话 IPC 5 项；真实内存索引一致性、批量隔离及范围持久化测试均通过。
+- 前端 `tsc --noEmit` 通过；全量 Vitest 使用 `--maxWorkers=2`，423 个测试文件通过、3 个文件按配置跳过；3,104 项测试通过、3 项跳过、0 项失败。
+- 原生开发应用冒烟（使用隔离的合成论文与本地确定性模型端点）：默认提供 `search_library`；规划状态为 planned、attempts=1、question_types 为 single；真实 Tauri 批量调用返回 `retrieved`，模式 `hybrid_fallback_keyword` 并附安全警告；界面渲染 42 位参与者及 S1 来源。该冒烟只验证接线，不是真实模型验证，也不代表检索召回质量。
+- 最终修订已恢复并完成原生窗口复测：未指定范围时检索全库并显示来源；界面固定 Beta 论文后，证据仅来自 Beta，回答显示 24 人及 Beta 来源；跨论文请求拆为 Alpha、Beta 两个绑定任务，每个任务仅返回对应论文证据，界面显示 Alpha 42 人 [S1]、Beta 24 人 [S2]。这些检查使用本地固定模型响应与真实 Tauri 检索，仅验证编排、范围和引用显示，不评估真实模型拆解质量或真实语料召回率。测试使用独立临时资料与测试模型端点，没有修改用户真实论文库或模型配置。
+- 未实现论文级召回、树状 BM25、双路召回或覆盖反馈，也未新增语义判定或补查调用。
+- 已有 Qasper 指标属于旧基线，不是本次实现的新结果。
+
+复核环境：基于 `b07053e` 的 `fix/search-library-integration` 分支；代码由显式指定的 `claude-haiku-5-5` 执行修改，随后独立审查并运行检查。没有新增本地生成模型，运行时继续使用用户配置的模型。
+
+复核命令：
+
+```powershell
+npm --workspace apps/desktop exec tsc -- --noEmit
+npm --workspace apps/desktop run test:frontend -- --maxWorkers=2
+cargo test -p neuink-search --lib
+cargo test -p neuink-ipc --lib commands::search::tests
+cargo test -p neuink-ipc --lib commands::conversation::tests
+```
+
+上述底层搜索模块在本次修复中没有改变排序算法；52 项检查未重复计入 IPC 的 20 项检查。本修复通过独立分支提交，合并与发布另行处理。

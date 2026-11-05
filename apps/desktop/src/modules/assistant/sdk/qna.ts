@@ -99,6 +99,7 @@ export async function answerWithGroundedAgent({
   root,
   activeExecution,
   profiles,
+  retrievalScope,
   runtimeSettings,
   scope,
   settings
@@ -129,13 +130,14 @@ export async function answerWithGroundedAgent({
   root: string;
   activeExecution?: AgentExecutionSelection | null;
   profiles?: LlmProfile[];
+  retrievalScope?: ScopeSnapshot;
   runtimeSettings?: AgentRuntimeSettings | null;
   scope: ScopeSnapshot;
   settings: LlmProfile;
 }): Promise<GroundedAnswer> {
   if (invocationPlan?.responseStyle === 'lightweight_chat') {
     return answerLightweightChat({ budget, execution, settings, abortSignal, question, activeExecution,
-      root, scope, onAnswerReset, onDelta, onReasoningDelta });
+      root, retrievalScope, scope, onAnswerReset, onDelta, onReasoningDelta });
   }
   const noteProposals = execution?.get<AssistantNoteProposal[]>('noteProposals') ?? [];
   const entryMetaProposals = execution?.get<AssistantEntryMetaProposal[]>('entryMetaProposals') ?? [];
@@ -205,6 +207,7 @@ export async function answerWithGroundedAgent({
     invocationPlan,
     profiles,
     root,
+    retrievalScope,
     runtimeSettings,
     scope
   });
@@ -412,7 +415,7 @@ function buildSelectedContextEntryNote(assistantContext?: AssistantContext | nul
     ...entries.map((entry) =>
       `- ${entry.entryTitle}${entry.contentKind && entry.contentKind !== 'entry' ? ` / ${entry.contentTitle ?? entry.contentKind}` : ''} (${entry.entryId})`
     ),
-    'Use read_entry_assistant_context with these entry IDs, or search_segments scoped to these entry IDs, before synthesizing from them.'
+    'Use read_entry_assistant_context with these entry IDs, or search_library scoped to these entry IDs, before synthesizing from them.'
   ].join('\n');
 }
 
@@ -635,7 +638,7 @@ export function buildToolNotes(
     plan?.editCoordinatePolicy === 'line_and_hash'
       ? 'For Markdown changes, read the current note first and use replace_lines, delete_lines, or insert_lines with exact 1-based logical Markdown line coordinates and expected_text. Do not regenerate or replace unrelated note content.'
       : '',
-    plan?.needsSegmentSearch ? 'Planner requires search_segments before answering if evidence is not already pinned.' : '',
+    plan?.needsSegmentSearch ? 'Planner requires search_library before answering if evidence is not already pinned.' : '',
     plan?.needsDocumentContext ? 'Router requires document context. Use explicit @ selections first, otherwise use the frozen active Entry from the Harness.' : ''
   ].join('\n');
 }

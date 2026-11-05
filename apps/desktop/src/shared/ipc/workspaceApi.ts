@@ -1202,6 +1202,35 @@ export async function searchEntries(
   });
 }
 
+export type SearchSegmentsBatchTask = {
+  task_id: string;
+  query: string;
+  mode: SearchMode;
+  top_k: number;
+  scope_entry_ids: EntryId[];
+  english_query: string | null;
+  sub_queries: string[];
+  section_filter: string | null;
+  segment_types: string[];
+};
+
+/** Ordered like the submitted tasks. `error` codes are fixed, path-free strings from the backend. */
+export type SearchSegmentsBatchItem = {
+  task_id: string;
+  results?: SearchResults | null;
+  error?: { code: string; message: string } | null;
+};
+
+/** One IPC call that prepares the workspace index once for every task in the batch. */
+export function searchSegmentsBatch(
+  root: string,
+  tasks: SearchSegmentsBatchTask[]
+): Promise<SearchSegmentsBatchItem[]> {
+  return invoke<SearchSegmentsBatchItem[]>('search_segments_batch', {
+    request: { root, tasks }
+  });
+}
+
 export async function searchSegments(
   root: string,
   query: string,

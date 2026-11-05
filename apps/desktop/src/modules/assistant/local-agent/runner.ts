@@ -102,7 +102,7 @@ async function executeLocalAgent(inputOptions: RunAssistantHarnessOptions, sessi
     const browserTabTarget = options.currentSurface?.kind === 'browser' ? options.currentSurface.browserTab : null;
     const restoredState = execution?.get<ToolRuntimeState>('tools:local');
     const runtime = await createAssistantTools({ execution, budget, plan,
-      restoredState: restoredState && { ...restoredState, readNotes: [] }, root:options.root, scope:options.scope, abortSignal:options.abortSignal,
+      restoredState: restoredState && { ...restoredState, readNotes: [] }, retrievalScope:options.retrievalScope, root:options.root, scope:options.scope, abortSignal:options.abortSignal,
       activeExecution:{agent:main}, runtimeSettings, currentEntry:options.currentEntry, currentNote:options.currentNote,
       contextSnapshot:snapshot, assistantContext:options.assistantContext, availableEntries:options.availableEntries,
       browserTabTarget,
